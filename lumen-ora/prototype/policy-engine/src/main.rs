@@ -155,35 +155,58 @@ where
 
 #[cfg(unix)]
 async fn run_server(engine: Arc<PolicyEngine>) {
-    use std::path::Path;
-    use tokio::net::UnixListener;
-
-    let socket_path = std::env::var("POLICY_ENGINE_SOCKET")
-        .unwrap_or_else(|_| "/tmp/lumen-policy.sock".to_string());
-
-    if Path::new(&socket_path).exists() {
-        let _ = std::fs::remove_file(&socket_path);
-    }
-
-    let listener = match UnixListener::bind(&socket_path) {
-        Ok(l) => l,
-        Err(e) => {
-            error!("Failed to bind Unix socket {socket_path}: {e}");
-            std::process::exit(1);
-        }
-    };
-    info!("Policy Engine listening on Unix socket {socket_path}");
-
-    loop {
-        match listener.accept().await {
-            Ok((stream, _)) => {
-                let eng = Arc::clone(&engine);
-                tokio::spawn(async move {
-                    let (r, w) = stream.into_split();
-                    handle_lines(BufReader::new(r), w, eng).await;
-                });
+    // If LUMEN_TCP_PORT is set, listen on TCP (for Windows-side dev/test access)
+    if let Ok(port) = std::env::var("LUMEN_TCP_PORT") {
+        use tokio::net::TcpListener;
+        let addr = format!("0.0.0.0:{port}");
+        let listener = match TcpListener::bind(&addr).await {
+            Ok(l) => l,
+            Err(e) => { error!("Failed to bind TCP {addr}: {e}"); std::process::exit(1); }
+        };
+        info!("Policy Engine listening on TCP {addr} (dev mode)");
+        loop {
+            match listener.accept().await {
+                Ok((stream, _)) => {
+                    let eng = Arc::clone(&engine);
+                    tokio::spawn(async move {
+                        let (r, w) = stream.into_split();
+                        handle_lines(BufReader::new(r), w, eng).await;
+                    });
+                }
+                Err(e) => error!("Accept error: {e}"),
             }
-            Err(e) => error!("Accept error: {e}"),
+        }
+    } else {
+        use std::path::Path;
+        use tokio::net::UnixListener;
+
+        let socket_path = std::env::var("POLICY_ENGINE_SOCKET")
+            .unwrap_or_else(|_| "/tmp/lumen-policy.sock".to_string());
+
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+
+        let listener = match UnixListener::bind(&socket_path) {
+            Ok(l) => l,
+            Err(e) => {
+                error!("Failed to bind Unix socket {socket_path}: {e}");
+                std::process::exit(1);
+            }
+        };
+        info!("Policy Engine listening on Unix socket {socket_path}");
+
+        loop {
+            match listener.accept().await {
+                Ok((stream, _)) => {
+                    let eng = Arc::clone(&engine);
+                    tokio::spawn(async move {
+                        let (r, w) = stream.into_split();
+                        handle_lines(BufReader::new(r), w, eng).await;
+                    });
+                }
+                Err(e) => error!("Accept error: {e}"),
+            }
         }
     }
 }

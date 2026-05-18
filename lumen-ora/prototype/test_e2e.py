@@ -111,6 +111,7 @@ def start_policy_engine_wsl(binary_path_wsl: str) -> subprocess.Popen | None:
     # POLICY_ENGINE_ADDR env var controls address
     cmd = [
         "wsl", "-d", "Ubuntu-22.04", "--",
+        "env", "LUMEN_TCP_PORT=8766",
         binary_path_wsl,
     ]
     print(f"  Starting policy engine: {' '.join(cmd)}")
@@ -751,8 +752,7 @@ def run_full_e2e_test() -> bool:
                 all_ok &= record("model responded (no tool call — model may not follow format)",
                                  len(text) > 10,
                                  f"text[:100]={text[:100]!r}")
-                print(f"  {yellow('Note: model did not emit a tool_call JSON block. '
-                                  'Consider fine-tuning the prompt.')}")
+                print(f"  {yellow('Note: model did not emit a tool_call JSON block. Consider fine-tuning the prompt.')}")
 
     except Exception as e:
         all_ok &= record("full e2e request", False, str(e))
