@@ -77,7 +77,11 @@ app.add_middleware(
 # ---------------------------------------------------------------------------
 
 class InferenceRequest(BaseModel):
-    prompt: str = Field(..., description="The user prompt / conversation history.")
+    prompt: str = Field(..., description="The latest user message.")
+    messages: list[dict[str, Any]] = Field(
+        default_factory=list,
+        description="Prior conversation turns [{role, content}]. If provided, builds multi-turn context.",
+    )
     tools: list[dict[str, Any]] = Field(
         default_factory=lambda: TOOL_SCHEMAS,
         description="Tool schemas to expose to the model.",
@@ -203,34 +207,70 @@ async def evaluate_tool_call_policy(
 # llama.cpp interaction
 # ---------------------------------------------------------------------------
 
+def _build_system_prompt(tools: list[dict[str, Any]]) -> str:
+    tool_names = ", ".join(t["name"] for t in tools)
+    tool_json = json.dumps(tools, indent=2)
+    return (
+        "You are Lumen, an AI operating system interface. "
+        "You have access to these tools: " + tool_names + "\n\n"
+        "TOOL SCHEMAS:\n"
+        f"{tool_json}\n\n"
+        "TOOL CALL FORMAT — when you need to use a tool, output EXACTLY this on its own line "
+        "(valid JSON, nothing before or after on that line):\n"
+        '{"tool_call": {"name": "TOOL_NAME", "parameters": {"param": "value"}}}\n\n'
+        "RULES:\n"
+        "1. Output the tool call JSON on its own line, then stop.\n"
+        "2. After receiving a tool result, give a natural language response.\n"
+        "3. If you do not need a tool, respond directly in plain text.\n\n"
+        "EXAMPLE:\n"
+        "User: List the files in my home directory\n"
+        '{"tool_call": {"name": "list_directory", "parameters": {"path": "~"}}}\n'
+        "Tool result: [{\"name\": \"Documents\", \"type\": \"directory\", \"size\": -1}]\n"
+        "Your home directory contains: Documents (directory), ...\n"
+    )
+
+
+def _build_qwen_prompt(
+    prompt: str,
+    prior_messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]],
+    conversation_suffix: str = "",
+) -> str:
+    """Build a Qwen2.5 chat-template prompt with optional prior conversation turns."""
+    system = _build_system_prompt(tools)
+    parts = [f"<|im_start|>system\n{system}<|im_end|>"]
+    for msg in prior_messages:
+        role = msg.get("role", "user")
+        content = msg.get("content", "")
+        parts.append(f"<|im_start|>{role}\n{content}<|im_end|>")
+    parts.append(f"<|im_start|>user\n{prompt}<|im_end|>")
+    if conversation_suffix:
+        parts.append(conversation_suffix)
+    parts.append("<|im_start|>assistant\n")
+    return "\n".join(parts)
+
+
 async def query_llama(
     prompt: str,
+    prior_messages: list[dict[str, Any]],
     tools: list[dict[str, Any]],
     max_tokens: int,
     temperature: float,
     stream: bool,
+    conversation_suffix: str = "",
 ) -> AsyncIterator[str]:
     """
     POST to llama-server's /completion endpoint and yield token chunks.
-    Handles both streaming and non-streaming modes.
+    Uses Qwen2.5 chat template (<|im_start|>/<|im_end|>).
     """
-    # Build a tool-aware system prompt when tools are available.
-    tool_json = json.dumps(tools, indent=2)
-    system = (
-        "You are a helpful AI assistant with access to the following tools:\n"
-        f"{tool_json}\n\n"
-        "To call a tool, output a JSON block on its own line in this format:\n"
-        '{"tool_call": {"name": "<tool_name>", "parameters": {<params>}}}\n'
-        "Wait for the tool result before continuing your response.\n"
-    )
-    full_prompt = f"<|system|>\n{system}\n<|user|>\n{prompt}\n<|assistant|>\n"
+    full_prompt = _build_qwen_prompt(prompt, prior_messages, tools, conversation_suffix)
 
     payload = {
         "prompt": full_prompt,
         "n_predict": max_tokens,
         "temperature": temperature,
         "stream": stream,
-        "stop": ["<|user|>", "<|system|>"],
+        "stop": ["<|im_end|>", "<|im_start|>"],
     }
 
     async with httpx.AsyncClient(timeout=120.0) as client:
@@ -281,39 +321,57 @@ def extract_tool_call(text: str) -> dict[str, Any] | None:
 
 async def run_inference(request: InferenceRequest) -> InferenceResponse:
     """
-    Full inference pipeline:
+    Full inference pipeline with agentic tool loop (up to 5 iterations):
     1. Query the model.
     2. Parse any tool calls from the model output.
     3. For each tool call, check with the Policy Engine.
-    4. Execute allowed tool calls and inject results.
-    5. Return the complete response.
+    4. Execute allowed tool calls, inject results into the conversation, repeat.
+    5. Return the final natural-language response once no more tool calls are made.
     """
     log.info("Session %s — inference start", request.session_id)
 
-    accumulated = ""
     tool_results: list[ToolCallResult] = []
+    # conversation_suffix accumulates tool call/result turns within this request
+    conversation_suffix = ""
+    final_text = ""
+    finish_reason = "stop"
+    MAX_ITERATIONS = 5
 
-    # Collect the full model output first (we'll handle streaming separately).
-    async for token in query_llama(
-        request.prompt, request.tools, request.max_tokens, request.temperature, stream=False
-    ):
-        accumulated += token
+    for iteration in range(MAX_ITERATIONS):
+        log.info("Session %s — iteration %d", request.session_id, iteration + 1)
 
-    log.info("Session %s — model output: %d chars", request.session_id, len(accumulated))
+        accumulated = ""
+        async for token in query_llama(
+            request.prompt,
+            request.messages,
+            request.tools,
+            request.max_tokens,
+            request.temperature,
+            stream=False,
+            conversation_suffix=conversation_suffix,
+        ):
+            accumulated += token
 
-    # Check for tool calls in the output.
-    tool_call = extract_tool_call(accumulated)
-    if tool_call:
+        log.info("Session %s — model output: %d chars", request.session_id, len(accumulated))
+
+        # Check for a tool call in this output.
+        tool_call = extract_tool_call(accumulated)
+        if not tool_call:
+            # Model produced a plain response — we're done.
+            final_text = accumulated
+            finish_reason = "stop"
+            log.info("Session %s — no tool call, finishing", request.session_id)
+            break
+
         tool_name = tool_call.get("name", "")
         parameters = tool_call.get("parameters", {})
-
         log.info("Session %s — tool call detected: %s", request.session_id, tool_name)
 
         # Policy check.
         policy_result = await evaluate_tool_call_policy(tool_name, parameters)
         log.info(
             "Session %s — policy decision for %s: %s",
-            request.session_id, tool_name, policy_result.decision
+            request.session_id, tool_name, policy_result.decision,
         )
 
         call_result = ToolCallResult(
@@ -322,28 +380,53 @@ async def run_inference(request: InferenceRequest) -> InferenceResponse:
             policy=policy_result,
         )
 
-        if policy_result.decision == "Allow":
-            try:
-                result = dispatch_tool(tool_name, parameters)
-                call_result.result = result
-                log.info("Session %s — tool %s executed successfully", request.session_id, tool_name)
-            except Exception as exc:
-                call_result.error = str(exc)
-                log.error("Session %s — tool %s error: %s", request.session_id, tool_name, exc)
-        elif policy_result.decision == "Deny":
+        if policy_result.decision == "Deny":
             call_result.error = f"DENIED by policy: {policy_result.detail}"
             log.warning("Session %s — tool %s denied: %s", request.session_id, tool_name, policy_result.detail)
-        else:  # RequireConfirmation
+            tool_results.append(call_result)
+            final_text = accumulated
+            finish_reason = "tool_call"
+            break
+
+        if policy_result.decision == "RequireConfirmation":
             call_result.error = f"REQUIRES CONFIRMATION: {policy_result.detail}"
             log.info("Session %s — tool %s requires confirmation", request.session_id, tool_name)
+            tool_results.append(call_result)
+            final_text = accumulated
+            finish_reason = "needs_confirmation"
+            break
+
+        # policy_result.decision == "Allow" — execute the tool.
+        try:
+            result = dispatch_tool(tool_name, parameters)
+            call_result.result = result
+            log.info("Session %s — tool %s executed successfully", request.session_id, tool_name)
+        except Exception as exc:
+            call_result.error = str(exc)
+            result = {"error": str(exc)}
+            log.error("Session %s — tool %s error: %s", request.session_id, tool_name, exc)
 
         tool_results.append(call_result)
 
+        # Feed tool result back using Qwen2.5 template so next pass sees full context.
+        result_json = json.dumps(result, default=str)
+        conversation_suffix += (
+            f"<|im_start|>assistant\n{accumulated}<|im_end|>\n"
+            f"<|im_start|>tool_result\n{result_json}<|im_end|>\n"
+        )
+        # Carry on — the next iteration will ask the model to interpret the result.
+
+    else:
+        # Exhausted MAX_ITERATIONS — return whatever we have.
+        log.warning("Session %s — max iterations (%d) reached", request.session_id, MAX_ITERATIONS)
+        final_text = accumulated  # noqa: F821 — always set inside loop
+        finish_reason = "length"
+
     return InferenceResponse(
         session_id=request.session_id,
-        text=accumulated,
+        text=final_text,
         tool_calls=tool_results,
-        finish_reason="tool_call" if tool_call else "stop",
+        finish_reason=finish_reason,
     )
 
 
@@ -352,19 +435,38 @@ async def run_inference(request: InferenceRequest) -> InferenceResponse:
 # ---------------------------------------------------------------------------
 
 async def stream_inference(request: InferenceRequest) -> AsyncIterator[dict[str, str]]:
-    """Yield SSE events for a streaming inference request."""
+    """
+    Yield SSE events for a streaming inference request.
+    Implements the same agentic tool loop as run_inference but streams tokens
+    from each model pass and emits tool events between passes.
+    """
     yield {"event": "session", "data": json.dumps({"session_id": request.session_id})}
 
-    accumulated = ""
-    async for token in query_llama(
-        request.prompt, request.tools, request.max_tokens, request.temperature, stream=True
-    ):
-        accumulated += token
-        yield {"event": "token", "data": json.dumps({"token": token})}
+    conversation_suffix = ""
+    MAX_ITERATIONS = 5
 
-    # After streaming completes, check for tool calls.
-    tool_call = extract_tool_call(accumulated)
-    if tool_call:
+    for iteration in range(MAX_ITERATIONS):
+        accumulated = ""
+
+        async for token in query_llama(
+            request.prompt,
+            request.messages,
+            request.tools,
+            request.max_tokens,
+            request.temperature,
+            stream=True,
+            conversation_suffix=conversation_suffix,
+        ):
+            accumulated += token
+            yield {"event": "token", "data": json.dumps({"token": token})}
+
+        # Check for a tool call in this pass.
+        tool_call = extract_tool_call(accumulated)
+        if not tool_call:
+            # Plain response — done.
+            yield {"event": "done", "data": json.dumps({"finish_reason": "stop"})}
+            return
+
         tool_name = tool_call.get("name", "")
         parameters = tool_call.get("parameters", {})
 
@@ -381,27 +483,49 @@ async def stream_inference(request: InferenceRequest) -> AsyncIterator[dict[str,
             ),
         }
 
-        if policy_result.decision == "Allow":
-            try:
-                result = dispatch_tool(tool_name, parameters)
-                yield {
-                    "event": "tool_result",
-                    "data": json.dumps({"tool": tool_name, "result": result}),
-                }
-            except Exception as exc:
-                yield {
-                    "event": "tool_error",
-                    "data": json.dumps({"tool": tool_name, "error": str(exc)}),
-                }
-        else:
+        if policy_result.decision == "Deny":
             yield {
                 "event": "tool_blocked",
                 "data": json.dumps(
-                    {"tool": tool_name, "reason": policy_result.detail or policy_result.decision}
+                    {"tool": tool_name, "reason": policy_result.detail or "Denied by policy"}
                 ),
             }
+            yield {"event": "done", "data": json.dumps({"finish_reason": "tool_call"})}
+            return
 
-    yield {"event": "done", "data": json.dumps({"finish_reason": "stop"})}
+        if policy_result.decision == "RequireConfirmation":
+            yield {
+                "event": "tool_blocked",
+                "data": json.dumps(
+                    {"tool": tool_name, "reason": policy_result.detail or "RequireConfirmation"}
+                ),
+            }
+            yield {"event": "done", "data": json.dumps({"finish_reason": "needs_confirmation"})}
+            return
+
+        # Allow — execute tool and feed result back.
+        try:
+            result = dispatch_tool(tool_name, parameters)
+            yield {
+                "event": "tool_result",
+                "data": json.dumps({"tool": tool_name, "result": result}),
+            }
+        except Exception as exc:
+            result = {"error": str(exc)}
+            yield {
+                "event": "tool_error",
+                "data": json.dumps({"tool": tool_name, "error": str(exc)}),
+            }
+
+        result_json = json.dumps(result, default=str)
+        conversation_suffix += (
+            f"<|im_start|>assistant\n{accumulated}<|im_end|>\n"
+            f"<|im_start|>tool_result\n{result_json}<|im_end|>\n"
+        )
+        # Next iteration streams the model's follow-up response.
+
+    # Max iterations reached.
+    yield {"event": "done", "data": json.dumps({"finish_reason": "length"})}
 
 
 # ---------------------------------------------------------------------------

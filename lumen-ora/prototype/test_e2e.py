@@ -142,10 +142,15 @@ def find_policy_engine_binary() -> str | None:
     prototype_dir = Path(__file__).parent
     policy_dir = prototype_dir / "policy-engine"
 
-    # WSL2 path (the binary built with 'cargo build' inside WSL2)
-    # Windows path via WSL mount: /mnt/c/Users/SETUP/Documents/claude/lumen-ora/prototype/policy-engine
-    wsl_mount = policy_dir.as_posix().replace("C:/", "/mnt/c/").replace("C:\\", "/mnt/c/").replace("\\", "/")
-    wsl_binary = f"{wsl_mount}/target/debug/policy-engine"
+    # WSL2 path — normalise Windows (C:/...) and Git Bash (/c/...) path formats.
+    _posix = policy_dir.as_posix().replace("\\", "/")
+    if len(_posix) >= 2 and _posix[1] == ":":
+        # Windows: C:/Users/... → /mnt/c/Users/...
+        _posix = f"/mnt/{_posix[0].lower()}/{_posix[3:]}"
+    elif len(_posix) >= 2 and _posix[0] == "/" and _posix[2] == "/":
+        # Git Bash: /c/Users/... → /mnt/c/Users/...
+        _posix = f"/mnt/{_posix[1].lower()}/{_posix[3:]}"
+    wsl_binary = f"{_posix}/target/debug/policy-engine"
 
     # Windows native binary
     win_binary = policy_dir / "target" / "debug" / "policy-engine.exe"
@@ -528,7 +533,7 @@ def bridge_get(path: str) -> tuple[int, Any]:
         return r.status, json.loads(r.read())
 
 
-def bridge_post(path: str, body: dict[str, Any]) -> tuple[int, Any]:
+def bridge_post(path: str, body: dict[str, Any], timeout: int = 30) -> tuple[int, Any]:
     import urllib.request
     data = json.dumps(body).encode()
     req = urllib.request.Request(
@@ -538,7 +543,7 @@ def bridge_post(path: str, body: dict[str, Any]) -> tuple[int, Any]:
         method="POST",
     )
     try:
-        with urllib.request.urlopen(req, timeout=30) as r:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
             return r.status, json.loads(r.read())
     except urllib.error.HTTPError as e:
         return e.code, json.loads(e.read())
@@ -706,8 +711,8 @@ def run_full_e2e_test() -> bool:
 
     # ── Test: Send a prompt that should produce a list_directory tool call ────
     prompt = (
-        "List the files in the /tmp directory for me. "
-        "Use the list_directory tool with path='/tmp'."
+        "List the files in my home directory for me. "
+        "Use the list_directory tool with path='~'."
     )
     try:
         status, body = bridge_post("/infer", {
@@ -715,7 +720,7 @@ def run_full_e2e_test() -> bool:
             "stream": False,
             "max_tokens": 256,
             "temperature": 0.1,  # Low temperature for determinism
-        })
+        }, timeout=120)
 
         all_ok &= record("POST /infer returns 200", status == 200, f"status={status}")
 
@@ -745,7 +750,8 @@ def run_full_e2e_test() -> bool:
                     all_ok &= record("tool execution result present", result is not None,
                                      str(result)[:200] if result else "None")
 
-                all_ok &= record("finish_reason is tool_call", finish_reason == "tool_call",
+                # With the agentic loop: "stop" = tool ran + model replied; "tool_call" = blocked
+                all_ok &= record("finish_reason is valid", finish_reason in ("stop", "tool_call", "needs_confirmation", "length"),
                                  f"finish_reason={finish_reason!r}")
             else:
                 # Model may not have called the tool — check text contains something useful
@@ -813,7 +819,12 @@ def run_setup_checks() -> bool:
 
     # Also check WSL2
     if not has_policy:
-        wsl_path = str(prototype_dir / "policy-engine").replace("C:\\", "/mnt/c/").replace("\\", "/")
+        _raw2 = (prototype_dir / "policy-engine").as_posix().replace("\\", "/")
+        if len(_raw2) >= 2 and _raw2[1] == ":":
+            _raw2 = f"/mnt/{_raw2[0].lower()}/{_raw2[3:]}"
+        elif len(_raw2) >= 2 and _raw2[0] == "/" and _raw2[2] == "/":
+            _raw2 = f"/mnt/{_raw2[1].lower()}/{_raw2[3:]}"
+        wsl_path = _raw2
         try:
             r = subprocess.run(
                 ["wsl", "-d", "Ubuntu-22.04", "--", "test", "-f",

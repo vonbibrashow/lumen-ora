@@ -1,0 +1,4 @@
+httpx>=0.27.0
+rich>=13.7.0
+# readline is stdlib on Linux/macOS; on Windows install pyreadline3 for arrow-key history:
+# pyreadline3>=3.4.1  (optional, Windows only)
