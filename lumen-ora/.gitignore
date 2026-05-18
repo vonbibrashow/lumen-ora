@@ -1,0 +1,119 @@
+# Lumen Ora .gitignore
+
+# ─── Build artifacts ─────────────────────────────────────────────────────────
+target/                    # Rust build output
+build/                     # General build output
+_build/                    # Genode build tree
+*.o                        # C/C++ object files
+*.a                        # Static libraries
+*.so                       # Shared libraries
+*.so.*
+*.dylib
+*.dll
+*.exe
+*.elf                      # Genode/seL4 ELF binaries
+*.img                      # OS images
+*.iso
+*.zst                      # Compressed images
+
+# ─── Model weights (never commit weights to the repo) ────────────────────────
+*.gguf
+*.ggml
+*.bin                      # Model bin files (also matched below, exceptions can be added)
+*.safetensors
+*.pt
+*.pth
+*.ckpt
+models/
+weights/
+
+# ─── Genode / seL4 specific ──────────────────────────────────────────────────
+var/                       # Genode depot variable data
+contrib/                   # Genode ported contrib packages (fetched at build time)
+depot/                     # Genode depot (fetched at build time)
+.genode_build_artifacts/
+
+# ─── Rust ────────────────────────────────────────────────────────────────────
+Cargo.lock                 # For libraries — keep for binaries; this repo has both
+# Note: policy-engine/ and inference-bridge/ are binaries so their Cargo.lock is committed.
+# Remove the Cargo.lock line above when those crates exist; replace with per-crate rules.
+
+# ─── Python ──────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyc
+.venv/
+venv/
+env/
+.env
+dist/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+htmlcov/
+.coverage
+coverage.xml
+
+# ─── Nix ─────────────────────────────────────────────────────────────────────
+result
+result-*
+.direnv/
+
+# ─── Logs and runtime data ───────────────────────────────────────────────────
+*.log
+audit.db                   # Policy Layer audit database (local only — never commit)
+*.audit
+sessions/                  # Session memory files (user-private)
+
+# ─── Editor and OS artifacts ─────────────────────────────────────────────────
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
+Desktop.ini
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+*.iml
+*.sublime-project
+*.sublime-workspace
+
+# ─── Secrets and credentials ─────────────────────────────────────────────────
+# These should never be committed. If you find one in the history, assume it
+# is compromised and rotate it immediately.
+*.pem
+*.key
+*.cert
+*.p12
+*.pfx
+id_rsa
+id_ed25519
+secrets/
+.env.local
+.env.*.local
+
+# ─── Benchmarks and profiling ────────────────────────────────────────────────
+flamegraph*.svg
+perf.data
+*.profraw
+*.profdata
+criterion/                 # Rust criterion benchmark output
+
+# ─── Documentation build output ──────────────────────────────────────────────
+docs/_site/
+docs/.jekyll-cache/
+site/
+
+# ─── Temporary files ─────────────────────────────────────────────────────────
+tmp/
+temp/
+scratch/
+*.tmp
+*.bak
+*.orig

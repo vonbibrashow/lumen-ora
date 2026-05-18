@@ -1,0 +1,185 @@
+LUMEN ORA MODEL LICENSE (RAIL — Responsible AI License)
+Version 1.0 — Effective Date: 2026-05-19
+
+This license governs use of model weights produced by or for the Lumen Ora
+project ("Lumen Ora Weights"). It applies only to weight artifacts explicitly
+marked as subject to this license. It does not apply to the Lumen Ora source
+code (governed by MPL 2.0) or to third-party base model weights (governed by
+their respective licenses).
+
+---
+
+PREAMBLE
+
+Language model weights are not ordinary software. They encode behaviors that
+emerge from training and that may be difficult to predict in novel deployment
+contexts. This license is therefore structured to be permissive for the vast
+majority of uses while drawing firm lines around specific harms that the Lumen
+Ora project considers non-negotiable.
+
+The RAIL framework (Responsible AI License) used here is adapted from work by
+the RAIL Initiative (rail.ai) and the BigScience Workshop. We acknowledge their
+pioneering work on use-based restrictions in AI licenses.
+
+---
+
+SECTION 1 — DEFINITIONS
+
+"Lumen Ora Weights" means any model weights, adapters (LoRA, QLoRA, etc.),
+quantized derivatives (GGUF, GPTQ, AWQ, etc.), or embedding checkpoints
+produced by the Lumen Ora project and marked as governed by this license.
+
+"You" means the individual or entity downloading, using, modifying, or
+distributing Lumen Ora Weights.
+
+"Downstream Use" means any application, product, service, or system that
+makes use of Lumen Ora Weights or derivatives of them.
+
+"Output" means any text, code, audio, image, structured data, or other
+content produced by a system running Lumen Ora Weights.
+
+"Derivative Weights" means model weights produced by fine-tuning, continued
+pre-training, merging, distillation, or any other process that uses Lumen Ora
+Weights as a starting point.
+
+---
+
+SECTION 2 — GRANT OF RIGHTS
+
+Subject to the restrictions in Section 3, You are hereby granted:
+
+2.1 Use: The right to use Lumen Ora Weights for any lawful purpose, including
+    commercial purposes, on any hardware you own or operate.
+
+2.2 Redistribution: The right to distribute Lumen Ora Weights, in original or
+    quantized form, provided this license is included with the distribution.
+
+2.3 Modification: The right to produce Derivative Weights, including through
+    fine-tuning, quantization, pruning, or merging with other weights.
+
+2.4 Sublicensing of Derivatives: The right to distribute Derivative Weights
+    under this same license or a license no less restrictive than this one.
+
+---
+
+SECTION 3 — USE RESTRICTIONS
+
+The following uses of Lumen Ora Weights and any Derivative Weights are
+prohibited regardless of jurisdiction, commercial context, or technical
+configuration. You may not use Lumen Ora Weights to:
+
+3.1 Generate or assist in generating content that sexually exploits minors
+    (CSAM), including synthetically generated material.
+
+3.2 Generate disinformation designed to interfere with democratic elections,
+    including fabricated statements attributed to real political candidates,
+    fabricated voting records, or false information about polling locations
+    or procedures.
+
+3.3 Generate or assist in generating content intended to facilitate violence
+    against identified individuals or groups, including credible threats,
+    targeted harassment campaigns, or material designed to incite others
+    to commit violence.
+
+3.4 Generate or assist in generating technical instructions for creating
+    weapons capable of mass casualties, including biological, chemical,
+    nuclear, or radiological weapons.
+
+3.5 Generate synthetic identity documents, financial instruments, or official
+    government records with the intent to commit fraud or identity theft.
+
+3.6 Operate autonomous systems that make consequential decisions about
+    individuals' legal status, employment, housing, credit, or medical
+    treatment without human review and without disclosure that AI is involved.
+
+3.7 Circumvent or assist in circumventing digital security measures,
+    including generating malware, ransomware, or exploits targeting
+    production systems without the owner's explicit authorization.
+
+---
+
+SECTION 4 — CONDITIONS
+
+4.1 Attribution. Any public deployment of a system using Lumen Ora Weights
+    must include a notice that the system uses Lumen Ora Weights and a link
+    to this license. The notice need not be prominent but must be findable
+    (e.g., in a model card, an "about" page, or a legal notice).
+
+4.2 License propagation. Any distribution of Derivative Weights must include
+    this license or a license that imposes at least the same restrictions
+    listed in Section 3.
+
+4.3 No misrepresentation. You may not represent Lumen Ora Weights or
+    Derivative Weights as human-authored content in contexts where the
+    distinction is material.
+
+4.4 Export compliance. You are responsible for complying with applicable
+    export control laws in your jurisdiction.
+
+---
+
+SECTION 5 — THIRD-PARTY BASE WEIGHTS
+
+Lumen Ora Weights may be derived from third-party base model weights (e.g.,
+Llama, Mistral, Qwen, Gemma). Where this is the case:
+
+- The Lumen Ora project will document the base model in the model card for
+  each weight artifact.
+- The use restrictions in Section 3 of this license apply in addition to,
+  not instead of, any restrictions in the base model's license.
+- If the base model's license is more restrictive in any dimension, the
+  more restrictive terms apply.
+- The Lumen Ora project makes no representation that any use permitted by
+  this license is also permitted by the base model's license. You are
+  responsible for checking both.
+
+---
+
+SECTION 6 — DISCLAIMER AND LIMITATION OF LIABILITY
+
+LUMEN ORA WEIGHTS ARE PROVIDED "AS IS" WITHOUT WARRANTY OF ANY KIND,
+EXPRESS OR IMPLIED. THE LUMEN ORA PROJECT MAKES NO WARRANTY REGARDING
+ACCURACY, SAFETY, OR SUITABILITY FOR ANY PURPOSE. YOU USE LUMEN ORA
+WEIGHTS AT YOUR OWN RISK.
+
+TO THE MAXIMUM EXTENT PERMITTED BY APPLICABLE LAW, THE LUMEN ORA PROJECT
+AND ITS CONTRIBUTORS SHALL NOT BE LIABLE FOR ANY DIRECT, INDIRECT,
+INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES ARISING FROM
+YOUR USE OF LUMEN ORA WEIGHTS OR ANY OUTPUT GENERATED BY SYSTEMS USING
+THEM, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGES.
+
+---
+
+SECTION 7 — TERMINATION
+
+Your rights under this license terminate automatically if you violate any
+of the restrictions in Section 3. Upon termination, you must delete all
+copies of Lumen Ora Weights in your possession.
+
+The Lumen Ora Steering Council may reinstate your rights upon written
+request if the violation was inadvertent and you have taken corrective
+action.
+
+---
+
+SECTION 8 — GOVERNING LAW AND JURISDICTION
+
+This license shall be governed by the laws of the jurisdiction in which
+the Lumen Ora Foundation is incorporated. Disputes shall be resolved by
+binding arbitration before a mutually agreed arbitrator, except that either
+party may seek injunctive relief in any court of competent jurisdiction
+for violations of Section 3.
+
+---
+
+SECTION 9 — UPDATES TO THIS LICENSE
+
+The Lumen Ora Steering Council may issue updated versions of this license.
+Updated versions will be published at https://lumenos.org/license-weights.
+Weight artifacts are governed by the version of this license in effect at
+the time of their release, unless the artifact's model card specifies
+otherwise.
+
+---
+
+Questions about this license: legal@lumenos.org
