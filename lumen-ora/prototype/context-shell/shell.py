@@ -7,6 +7,7 @@ Usage:
     python shell.py           # interactive mode
     python shell.py --check   # connectivity check, exit 0/1
     python shell.py --voice   # enable voice mode (STT + TTS)
+    python shell.py --camera  # enable camera gesture + lip-VAD input
 """
 
 from __future__ import annotations
@@ -14,6 +15,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import queue
 import sys
 import textwrap
 import threading
@@ -92,6 +94,37 @@ except ImportError:
     _VOICE_MISSING.append("pyttsx3")
 
 _VOICE_DEPS_OK = not _VOICE_MISSING
+
+# ---------------------------------------------------------------------------
+# Optional camera deps — cv2 + mediapipe; shell works without them
+# ---------------------------------------------------------------------------
+
+_CAMERA_DEPS_OK = False
+
+try:
+    import cv2 as _cv2  # noqa: F401
+    import mediapipe as _mp  # noqa: F401
+    _CAMERA_DEPS_OK = True
+except ImportError:
+    _CAMERA_DEPS_OK = False
+
+# Thread-safe queue for camera events (always created; empty when camera is off)
+_camera_event_queue: queue.Queue = queue.Queue()
+
+# Lip-VAD state (shared between camera thread and REPL)
+_lip_speaking = False
+_camera_thread_running = threading.Event()  # set when the camera daemon is active
+
+# Lip-VAD thresholds
+LIP_OPEN_THRESHOLD = 0.015   # normalized distance between landmarks 13 and 14
+_LIP_OPEN_FRAMES_TO_START = 3   # consecutive open frames before recording starts
+_LIP_CLOSE_FRAMES_TO_STOP = 8   # consecutive closed frames before recording stops
+
+# Gesture wave detection
+_WAVE_VELOCITY_THRESHOLD = 0.15  # normalized units/frame
+
+# Env var for lip-VAD
+LUMEN_LIP_VAD = os.environ.get("LUMEN_LIP_VAD", "0").strip() not in ("0", "false", "no")
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -239,7 +272,12 @@ def check_policy() -> tuple[bool, str]:
 # Startup banner
 # ---------------------------------------------------------------------------
 
-def print_banner(bridge_ok: bool, policy_ok: bool, voice_mode: bool = False) -> None:
+def print_banner(
+    bridge_ok: bool,
+    policy_ok: bool,
+    voice_mode: bool = False,
+    camera_mode: bool = False,
+) -> None:
     bridge_status = (
         _green("Bridge: connected") if bridge_ok else _red("Bridge: not running")
     )
@@ -259,10 +297,14 @@ def print_banner(bridge_ok: bool, policy_ok: bool, voice_mode: bool = False) -> 
     console.print(
         f"{policy_status}  [dim]|[/dim]  {bridge_status}  [dim]|[/dim]  {model_status}"
     )
+
+    hints: list[str] = []
     if voice_mode:
-        console.print("[dim]Hold Space to speak / press Enter to type. /help for commands.[/dim]")
-    else:
-        console.print("[dim]Type anything. /help for commands.[/dim]")
+        hints.append("Hold Space to speak / press Enter to type.")
+    if camera_mode:
+        hints.append("Camera: gesture+lip-vad active")
+    hints.append("/help for commands.")
+    console.print(f"[dim]{' '.join(hints)}[/dim]")
     console.print(f"[dim]{divider}[/dim]")
     console.print()
 
@@ -583,21 +625,288 @@ def _get_voice_engine() -> VoiceEngine:
 
 
 # ---------------------------------------------------------------------------
+# Camera subsystem — gesture recognition + lip-VAD
+# ---------------------------------------------------------------------------
+
+def _classify_gesture(hand_landmarks, handedness_label: str) -> str | None:
+    """
+    Classify a hand gesture from MediaPipe hand landmarks.
+    Returns one of: 'thumbs_up', 'open_palm', 'peace', 'wave', or None.
+
+    Landmark indices used:
+        4  = thumb tip
+        3  = thumb IP
+        8  = index tip
+        6  = index PIP
+        12 = middle tip
+        10 = middle PIP
+        16 = ring tip
+        14 = ring PIP
+        20 = pinky tip
+        18 = pinky PIP
+        0  = wrist
+        9  = middle MCP (base)
+    """
+    lm = hand_landmarks.landmark
+
+    # Helper: is a finger extended? (tip above PIP in y-axis; y increases downward)
+    def _extended(tip_idx: int, pip_idx: int) -> bool:
+        return lm[tip_idx].y < lm[pip_idx].y
+
+    index_ext = _extended(8, 6)
+    middle_ext = _extended(12, 10)
+    ring_ext = _extended(16, 14)
+    pinky_ext = _extended(20, 18)
+
+    # Thumb: compare x-position relative to IP joint (handedness-aware)
+    if handedness_label == "Right":
+        thumb_ext = lm[4].x < lm[3].x
+    else:
+        thumb_ext = lm[4].x > lm[3].x
+
+    fingers_up = sum([index_ext, middle_ext, ring_ext, pinky_ext])
+
+    # Open palm: all 4 fingers + thumb extended
+    if thumb_ext and fingers_up == 4:
+        return "open_palm"
+
+    # Peace/V sign: index + middle extended, ring + pinky folded
+    if index_ext and middle_ext and not ring_ext and not pinky_ext:
+        return "peace"
+
+    # Thumbs up: only thumb extended, all fingers folded
+    if thumb_ext and fingers_up == 0:
+        return "thumbs_up"
+
+    return None
+
+
+def _camera_worker(stop_event: threading.Event, voice_state_ref: list) -> None:
+    """
+    Background daemon thread: runs MediaPipe hand + face mesh detection.
+    Posts events to _camera_event_queue.
+    voice_state_ref is a one-element list holding the voice_state dict so
+    we can toggle voice from this thread.
+    """
+    global _lip_speaking
+
+    try:
+        import cv2
+        import mediapipe as mp
+    except ImportError:
+        return
+
+    mp_hands = mp.solutions.hands
+    mp_face_mesh = mp.solutions.face_mesh
+
+    hands_detector = mp_hands.Hands(
+        max_num_hands=1,
+        min_detection_confidence=0.7,
+        min_tracking_confidence=0.5,
+    )
+    face_detector = mp_face_mesh.FaceMesh(
+        max_num_faces=1,
+        min_detection_confidence=0.5,
+        min_tracking_confidence=0.5,
+        refine_landmarks=True,
+    )
+
+    cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        console.print(_red("[camera] Could not open camera device."))
+        return
+
+    # --- State for gesture debounce ---
+    _last_gesture: str | None = None
+    _gesture_cooldown = 0          # frames to suppress repeated gesture firing
+    _GESTURE_COOLDOWN_FRAMES = 20  # ~0.67 s at 30 fps
+
+    # --- State for wave detection ---
+    _prev_wrist_x: float | None = None
+    _wrist_dx_history: list[float] = []
+    _WAVE_HISTORY = 6  # frames
+
+    # --- State for lip-VAD ---
+    _lip_open_count = 0
+    _lip_close_count = 0
+
+    _camera_thread_running.set()
+
+    try:
+        while not stop_event.is_set():
+            ret, frame = cap.read()
+            if not ret:
+                continue
+
+            # Convert BGR → RGB once for both detectors
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            rgb.flags.writeable = False
+
+            # ----------------------------------------------------------------
+            # Hand / gesture detection
+            # ----------------------------------------------------------------
+            hand_results = hands_detector.process(rgb)
+
+            gesture: str | None = None
+            if hand_results.multi_hand_landmarks:
+                hand_lm = hand_results.multi_hand_landmarks[0]
+                handedness = (
+                    hand_results.multi_handedness[0].classification[0].label
+                    if hand_results.multi_handedness
+                    else "Right"
+                )
+
+                # Wave: track wrist x-velocity
+                wrist_x = hand_lm.landmark[0].x
+                if _prev_wrist_x is not None:
+                    dx = abs(wrist_x - _prev_wrist_x)
+                    _wrist_dx_history.append(dx)
+                    if len(_wrist_dx_history) > _WAVE_HISTORY:
+                        _wrist_dx_history.pop(0)
+                    avg_velocity = sum(_wrist_dx_history) / len(_wrist_dx_history)
+                    if avg_velocity > _WAVE_VELOCITY_THRESHOLD:
+                        gesture = "wave"
+                _prev_wrist_x = wrist_x
+
+                if gesture is None:
+                    gesture = _classify_gesture(hand_lm, handedness)
+            else:
+                _prev_wrist_x = None
+                _wrist_dx_history.clear()
+
+            # Fire gesture event (with cooldown to avoid repeated triggers)
+            if gesture is not None and _gesture_cooldown == 0:
+                event: str | None = None
+                if gesture == "thumbs_up":
+                    event = "confirm"
+                elif gesture == "open_palm":
+                    event = "cancel"
+                elif gesture == "peace":
+                    event = "voice_toggle"
+                elif gesture == "wave":
+                    event = "new_session"
+
+                if event is not None and event != _last_gesture:
+                    _camera_event_queue.put(event)
+                    _last_gesture = event
+                    _gesture_cooldown = _GESTURE_COOLDOWN_FRAMES
+            elif _gesture_cooldown > 0:
+                _gesture_cooldown -= 1
+                if gesture is None:
+                    _last_gesture = None
+
+            # ----------------------------------------------------------------
+            # Lip-VAD (only when LUMEN_LIP_VAD env var is set)
+            # ----------------------------------------------------------------
+            if LUMEN_LIP_VAD:
+                face_results = face_detector.process(rgb)
+                if face_results.multi_face_landmarks:
+                    face_lm = face_results.multi_face_landmarks[0].landmark
+                    # Landmarks 13 = upper lip inner, 14 = lower lip inner
+                    upper_lip_y = face_lm[13].y
+                    lower_lip_y = face_lm[14].y
+                    lip_distance = abs(lower_lip_y - upper_lip_y)
+
+                    if lip_distance > LIP_OPEN_THRESHOLD:
+                        _lip_open_count += 1
+                        _lip_close_count = 0
+                    else:
+                        _lip_close_count += 1
+                        _lip_open_count = 0
+
+                    # Transition: closed → speaking
+                    if (
+                        not _lip_speaking
+                        and _lip_open_count >= _LIP_OPEN_FRAMES_TO_START
+                    ):
+                        _lip_speaking = True
+                        _camera_event_queue.put("lip_start")
+
+                    # Transition: speaking → stopped
+                    elif (
+                        _lip_speaking
+                        and _lip_close_count >= _LIP_CLOSE_FRAMES_TO_STOP
+                    ):
+                        _lip_speaking = False
+                        _camera_event_queue.put("lip_stop")
+                else:
+                    # No face detected — reset lip state silently (fall back to PTT)
+                    _lip_open_count = 0
+                    _lip_close_count = 0
+                    if _lip_speaking:
+                        _lip_speaking = False
+                        _camera_event_queue.put("lip_stop")
+
+    finally:
+        _camera_thread_running.clear()
+        hands_detector.close()
+        face_detector.close()
+        cap.release()
+
+
+# Module-level camera state
+_camera_stop_event: threading.Event | None = None
+_camera_bg_thread: threading.Thread | None = None
+
+
+def start_camera(voice_state: dict) -> bool:
+    """
+    Start the camera background thread.
+    Returns True if started successfully, False otherwise.
+    Guarded: silently no-ops if cv2/mediapipe are unavailable.
+    """
+    global _camera_stop_event, _camera_bg_thread
+
+    if not _CAMERA_DEPS_OK:
+        return False
+
+    if _camera_bg_thread is not None and _camera_bg_thread.is_alive():
+        return True  # already running
+
+    _camera_stop_event = threading.Event()
+    voice_state_ref = [voice_state]  # mutable container for cross-thread access
+
+    _camera_bg_thread = threading.Thread(
+        target=_camera_worker,
+        args=(_camera_stop_event, voice_state_ref),
+        daemon=True,
+        name="lumen-camera",
+    )
+    _camera_bg_thread.start()
+    return True
+
+
+def stop_camera() -> None:
+    """Signal the camera thread to stop."""
+    global _camera_stop_event
+    if _camera_stop_event is not None:
+        _camera_stop_event.set()
+    _camera_thread_running.clear()
+
+
+def camera_is_running() -> bool:
+    """Return True if the camera daemon thread is active."""
+    return _camera_thread_running.is_set()
+
+
+# ---------------------------------------------------------------------------
 # Special / commands
 # ---------------------------------------------------------------------------
 
 def cmd_help(voice_mode: bool = False) -> None:
     lines = [
-        "[bold]/help[/bold]       — show this help",
-        "[bold]/exit[/bold]       — exit the shell (also Ctrl+D)",
-        "[bold]/quit[/bold]       — exit the shell",
-        "[bold]/clear[/bold]      — clear screen and reset display",
-        "[bold]/new[/bold]        — start a fresh conversation (clears context)",
-        "[bold]/history[/bold]    — show last 10 exchanges",
-        "[bold]/session[/bold]    — show session ID and history stats",
-        "[bold]/model[/bold]      — show which model is loaded",
-        "[bold]/voice on[/bold]   — enable voice mode (STT + TTS)",
-        "[bold]/voice off[/bold]  — disable voice mode",
+        "[bold]/help[/bold]        — show this help",
+        "[bold]/exit[/bold]        — exit the shell (also Ctrl+D)",
+        "[bold]/quit[/bold]        — exit the shell",
+        "[bold]/clear[/bold]       — clear screen and reset display",
+        "[bold]/new[/bold]         — start a fresh conversation (clears context)",
+        "[bold]/history[/bold]     — show last 10 exchanges",
+        "[bold]/session[/bold]     — show session ID and history stats",
+        "[bold]/model[/bold]       — show which model is loaded",
+        "[bold]/voice on[/bold]    — enable voice mode (STT + TTS)",
+        "[bold]/voice off[/bold]   — disable voice mode",
+        "[bold]/camera on[/bold]   — enable camera gesture + lip-VAD input",
+        "[bold]/camera off[/bold]  — disable camera gesture + lip-VAD input",
     ]
     console.print(
         Panel(
@@ -644,11 +953,13 @@ def handle_special(
     session_id: str = "",
     conversation: list[dict] | None = None,
     voice_state: dict | None = None,
+    camera_state: dict | None = None,
 ) -> bool:
     """
     Handle /commands. Return True if handled (caller should not send to AI).
     Return False if not a special command.
     voice_state is a mutable dict with key 'enabled' (bool).
+    camera_state is a mutable dict with key 'enabled' (bool).
     """
     stripped = cmd.strip()
     if not stripped.startswith("/"):
@@ -712,6 +1023,39 @@ def handle_special(
             console.print(
                 f"Voice mode is currently [bold]{status}[/bold]. "
                 "Use [bold]/voice on[/bold] or [bold]/voice off[/bold]."
+            )
+        return True
+
+    if verb == "/camera":
+        if camera_state is None:
+            console.print(_dim("/camera requires an active shell session."))
+            return True
+        if rest == "on":
+            if not _CAMERA_DEPS_OK:
+                console.print(
+                    "Camera deps not installed: pip install opencv-python mediapipe"
+                )
+            else:
+                if not camera_state.get("enabled"):
+                    camera_state["enabled"] = True
+                    vs = voice_state or {}
+                    ok = start_camera(vs)
+                    if ok:
+                        console.print(_green("Camera mode enabled. Gesture + lip-VAD active."))
+                    else:
+                        camera_state["enabled"] = False
+                        console.print(_red("Camera failed to start. Is a camera device connected?"))
+                else:
+                    console.print(_dim("Camera is already running."))
+        elif rest == "off":
+            camera_state["enabled"] = False
+            stop_camera()
+            console.print(_dim("Camera mode disabled."))
+        else:
+            status = "on" if camera_state.get("enabled") else "off"
+            console.print(
+                f"Camera mode is currently [bold]{status}[/bold]. "
+                "Use [bold]/camera on[/bold] or [bold]/camera off[/bold]."
             )
         return True
 
@@ -813,10 +1157,92 @@ def _read_voice_or_text(voice_state: dict, prompt_str: str) -> str | None:
 
 
 # ---------------------------------------------------------------------------
+# Camera event handler (called inside REPL loop)
+# ---------------------------------------------------------------------------
+
+def _drain_camera_events(
+    voice_state: dict,
+    conversation: list[dict],
+    camera_state: dict,
+    pending_confirm: list[bool],
+) -> str | None:
+    """
+    Drain all pending camera events and handle them.
+    Returns a synthesised user-input string if the event maps to a text command,
+    or None if nothing actionable was queued.
+
+    pending_confirm is a one-element mutable list [bool] set to True when a
+    thumbs-up "confirm" event fires while a RequiresConfirmation prompt is active.
+    """
+    try:
+        while True:
+            event = _camera_event_queue.get_nowait()
+
+            if event == "confirm":
+                # Auto-answer any pending RequiresConfirmation prompt with "y"
+                pending_confirm[0] = True
+                console.print(_dim("[camera] Thumbs up detected — confirming action."))
+
+            elif event == "cancel":
+                # Send /new to clear conversation context
+                console.print(_dim("[camera] Open palm detected — clearing context."))
+                if conversation is not None:
+                    conversation.clear()
+                console.print(_dim("Conversation context cleared. Starting fresh."))
+
+            elif event == "voice_toggle":
+                # Toggle voice mode
+                if voice_state.get("enabled"):
+                    voice_state["enabled"] = False
+                    console.print(_dim("[camera] Peace sign — voice mode disabled."))
+                else:
+                    if _VOICE_DEPS_OK:
+                        voice_state["enabled"] = True
+                        console.print(_green("[camera] Peace sign — voice mode enabled."))
+                    else:
+                        console.print(
+                            _red(
+                                "[camera] Voice deps not installed: "
+                                + ", ".join(_VOICE_MISSING)
+                            )
+                        )
+
+            elif event == "new_session":
+                # Wave → new session (same as /new)
+                console.print(_dim("[camera] Wave detected — starting new session."))
+                if conversation is not None:
+                    conversation.clear()
+                console.print(_dim("Conversation context cleared. Starting fresh."))
+
+            elif event == "lip_start":
+                # Lip-VAD: lips opened — start voice recording if voice mode active
+                if voice_state.get("enabled") and _VOICE_DEPS_OK:
+                    ve = _get_voice_engine()
+                    console.print(_dim("[lip-vad] Speaking detected — recording…"))
+                    ve.start_recording()
+
+            elif event == "lip_stop":
+                # Lip-VAD: lips closed — stop recording and transcribe
+                if voice_state.get("enabled") and _VOICE_DEPS_OK:
+                    ve = _get_voice_engine()
+                    audio = ve.stop_recording()
+                    if audio is not None and len(audio) >= _AUDIO_SAMPLE_RATE * 0.3:
+                        console.print(_dim("[lip-vad] Transcribing…"))
+                        text = ve.transcribe(audio)
+                        if text:
+                            console.print(f"  [dim]You said:[/dim] {text}")
+                            return text  # inject as user input
+    except queue.Empty:
+        pass
+
+    return None
+
+
+# ---------------------------------------------------------------------------
 # REPL
 # ---------------------------------------------------------------------------
 
-def repl(session_id: str, start_voice: bool = False) -> None:
+def repl(session_id: str, start_voice: bool = False, start_cam_input: bool = False) -> None:
     """Main read-eval-print loop."""
     # In-memory conversation for multi-turn context (trimmed to MAX_CONTEXT_TURNS)
     conversation: list[dict] = []
@@ -824,21 +1250,52 @@ def repl(session_id: str, start_voice: bool = False) -> None:
     # Mutable voice state — passed to handle_special so /voice on/off works
     voice_state: dict = {"enabled": start_voice and _VOICE_DEPS_OK}
 
+    # Mutable camera state
+    camera_state: dict = {"enabled": False}
+
+    # Start camera thread if requested at launch
+    if start_cam_input and _CAMERA_DEPS_OK:
+        ok = start_camera(voice_state)
+        if ok:
+            camera_state["enabled"] = True
+        else:
+            console.print(_red("[camera] Failed to start camera. Is a device connected?"))
+    elif start_cam_input and not _CAMERA_DEPS_OK:
+        console.print(
+            "Camera deps not installed: pip install opencv-python mediapipe"
+        )
+
+    # Pending confirm from gesture (thumbs up)
+    _pending_confirm: list[bool] = [False]
+
     while True:
+        # ----------------------------------------------------------------
+        # Drain camera events at the top of each iteration
+        # ----------------------------------------------------------------
+        injected_text: str | None = None
+        if camera_state.get("enabled") or camera_is_running():
+            injected_text = _drain_camera_events(
+                voice_state, conversation, camera_state, _pending_confirm
+            )
+
         active_voice = voice_state.get("enabled", False)
         prompt_str = VOICE_PROMPT if active_voice else PROMPT
 
-        # --- Read ---
-        try:
-            line = _read_voice_or_text(voice_state, prompt_str)
-        except EOFError:
-            console.print()
-            console.print("[dim]Goodbye.[/dim]")
-            break
+        # If lip-VAD injected a transcribed utterance, use it directly
+        if injected_text:
+            line = injected_text
+        else:
+            # --- Read ---
+            try:
+                line = _read_voice_or_text(voice_state, prompt_str)
+            except EOFError:
+                console.print()
+                console.print("[dim]Goodbye.[/dim]")
+                break
 
-        if line is None:
-            # KeyboardInterrupt — re-prompt
-            continue
+            if line is None:
+                # KeyboardInterrupt — re-prompt
+                continue
 
         # Empty input — re-prompt
         if not line.strip():
@@ -862,7 +1319,13 @@ def repl(session_id: str, start_voice: bool = False) -> None:
             continue
 
         # --- Special commands ---
-        if handle_special(user_input, session_id, conversation, voice_state):
+        if handle_special(
+            user_input,
+            session_id,
+            conversation,
+            voice_state,
+            camera_state,
+        ):
             continue
 
         # --- Send to AI (with rolling conversation context) ---
@@ -962,6 +1425,11 @@ def main() -> None:
         action="store_true",
         help="Enable voice mode at startup (push-to-talk STT + TTS).",
     )
+    parser.add_argument(
+        "--camera",
+        action="store_true",
+        help="Enable camera gesture + lip-VAD input at startup.",
+    )
     args = parser.parse_args()
 
     if args.check:
@@ -983,13 +1451,23 @@ def main() -> None:
         console.print()
         start_voice = False
 
+    # --- Camera mode startup validation ---
+    start_cam = args.camera
+    if start_cam and not _CAMERA_DEPS_OK:
+        console.print(
+            "Camera deps not installed: pip install opencv-python mediapipe"
+        )
+        console.print("[dim]Continuing without camera input.[/dim]")
+        console.print()
+        start_cam = False
+
     # --- Normal interactive mode ---
     session_id = load_or_create_session_id()
 
     bridge_ok, _ = check_bridge()
     policy_ok, _ = check_policy()
 
-    print_banner(bridge_ok, policy_ok, voice_mode=start_voice)
+    print_banner(bridge_ok, policy_ok, voice_mode=start_voice, camera_mode=start_cam)
 
     if start_voice:
         console.print(
@@ -1007,10 +1485,12 @@ def main() -> None:
         )
 
     try:
-        repl(session_id, start_voice=start_voice)
+        repl(session_id, start_voice=start_voice, start_cam_input=start_cam)
     except KeyboardInterrupt:
         console.print()
         console.print("[dim]Goodbye.[/dim]")
+    finally:
+        stop_camera()
 
 
 if __name__ == "__main__":
