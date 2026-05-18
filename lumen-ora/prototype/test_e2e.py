@@ -671,13 +671,17 @@ def run_bridge_tests(skip_model: bool = True) -> tuple[bool, subprocess.Popen | 
         else:
             all_ok &= record("POST /evaluate_tool", False, str(e))
 
-    # ── Test 4: POST /infer without llama-server (expect 503) ─────────────────
-    if skip_model:
+    # ── Test 4: POST /infer ────────────────────────────────────────────────────
+    # When llama-server is running we need a generous timeout (7B on CPU is slow).
+    # When it's not running we expect a fast 503; 10 s is plenty.
+    _model_up = is_llama_running()
+    _infer_timeout = 150 if _model_up else 10
+    if skip_model or _model_up:
         try:
             status, body = bridge_post("/infer", {
                 "prompt": "List the files in my home directory",
                 "stream": False,
-            })
+            }, timeout=_infer_timeout)
             # Without llama-server: should get 503 (ConnectError)
             # With llama-server: should get 200
             if status == 503:
