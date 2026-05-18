@@ -47,7 +47,11 @@ log = logging.getLogger("lumen.bridge")
 # ---------------------------------------------------------------------------
 
 LLAMA_SERVER_URL = os.environ.get("LLAMA_SERVER_URL", "http://127.0.0.1:8080")
-POLICY_SOCKET_PATH = os.environ.get("POLICY_ENGINE_SOCKET", "/tmp/lumen-policy.sock")
+# POLICY_ENGINE_SOCKET can be:
+#   - A Unix socket path (Linux/macOS production): /tmp/lumen-policy.sock
+#   - A TCP address prefixed with "tcp://": tcp://127.0.0.1:8766 (Windows dev)
+# On Windows the policy engine binary falls back to TCP on 127.0.0.1:8766.
+POLICY_SOCKET_PATH = os.environ.get("POLICY_ENGINE_SOCKET", "tcp://127.0.0.1:8766")
 BRIDGE_HOST = os.environ.get("BRIDGE_HOST", "127.0.0.1")
 BRIDGE_PORT = int(os.environ.get("BRIDGE_PORT", "8765"))
 
@@ -112,6 +116,27 @@ class InferenceResponse(BaseModel):
 # Policy Engine client (Unix socket JSON-RPC)
 # ---------------------------------------------------------------------------
 
+def _parse_policy_socket(path: str) -> tuple[str, str | None, int | None]:
+    """
+    Parse POLICY_SOCKET_PATH into (mode, host, port).
+    mode is "tcp" or "unix".
+    """
+    if path.startswith("tcp://"):
+        addr = path[6:]  # strip "tcp://"
+        host, _, port_str = addr.rpartition(":")
+        return "tcp", host or "127.0.0.1", int(port_str) if port_str else 8766
+    return "unix", None, None
+
+
+async def _open_policy_connection(socket_path: str):
+    """Open an asyncio connection to the policy engine (Unix or TCP)."""
+    mode, host, port = _parse_policy_socket(socket_path)
+    if mode == "tcp":
+        return await asyncio.open_connection(host, port)
+    else:
+        return await asyncio.open_unix_connection(socket_path)
+
+
 async def evaluate_tool_call_policy(
     tool_name: str,
     parameters: dict[str, Any],
@@ -131,7 +156,7 @@ async def evaluate_tool_call_policy(
     payload = json.dumps(request) + "\n"
 
     try:
-        reader, writer = await asyncio.open_unix_connection(POLICY_SOCKET_PATH)
+        reader, writer = await _open_policy_connection(POLICY_SOCKET_PATH)
         writer.write(payload.encode())
         await writer.drain()
         line = await asyncio.wait_for(reader.readline(), timeout=5.0)
@@ -165,6 +190,9 @@ async def evaluate_tool_call_policy(
 
     except FileNotFoundError:
         log.warning("Policy engine socket not found at %s — running without enforcement", POLICY_SOCKET_PATH)
+        return PolicyEvalResult(decision="Allow", detail="Policy engine not running")
+    except ConnectionRefusedError:
+        log.warning("Policy engine not accepting connections at %s — running without enforcement", POLICY_SOCKET_PATH)
         return PolicyEvalResult(decision="Allow", detail="Policy engine not running")
     except Exception as exc:
         log.error("Policy engine communication error: %s", exc)

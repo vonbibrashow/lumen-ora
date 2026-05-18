@@ -1,0 +1,3 @@
+# This directory holds the llama.cpp Windows binaries.
+# Contents are git-ignored (see .gitignore).
+# Run `python prototype/setup_inference.py` to download them.

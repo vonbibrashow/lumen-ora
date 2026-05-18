@@ -3,9 +3,16 @@ __pycache__/
 *.pyo
 .venv/
 venv/
+# Model files (large — never commit)
 *.gguf
+models/*
+!models/.gitkeep
+# llama.cpp binaries (platform-specific — never commit)
 llama-cpp/*.exe
 llama-cpp/*.dll
 llama-cpp/*.so
 llama-cpp/llama-server
 llama-cpp/llama-cli
+llama-cpp/ggml-metal.metal
+# Keep the placeholder
+!llama-cpp/.gitkeep
