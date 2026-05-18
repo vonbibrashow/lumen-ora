@@ -25,3 +25,16 @@ ddgs>=8.0.0
 
 # Install all voice deps in one shot:
 #   pip install faster-whisper sounddevice soundfile keyboard pyttsx3
+
+# ---------------------------------------------------------------------------
+# Optional camera deps — install to enable --camera / /camera on
+# ---------------------------------------------------------------------------
+
+# optional camera input
+# opencv-python>=4.9.0
+
+# optional camera input
+# mediapipe>=0.10.0
+
+# Install all camera deps in one shot:
+#   pip install opencv-python mediapipe
