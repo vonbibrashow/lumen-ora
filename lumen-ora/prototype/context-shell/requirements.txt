@@ -1,4 +1,27 @@
+# Core deps (required)
 httpx>=0.27.0
 rich>=13.7.0
+ddgs>=8.0.0
+
 # readline is stdlib on Linux/macOS; on Windows install pyreadline3 for arrow-key history:
 # pyreadline3>=3.4.1  (optional, Windows only)
+
+# ---------------------------------------------------------------------------
+# Optional voice deps — install to enable --voice / /voice on
+# ---------------------------------------------------------------------------
+
+# Speech-to-text: local Whisper inference (pre-built wheels, no compilation needed)
+# faster-whisper>=1.0.0
+
+# Audio capture: record from microphone
+# sounddevice>=0.4.6
+# soundfile>=0.12.1
+
+# Hotkey detection: push-to-talk (Space key)
+# keyboard>=0.13.5
+
+# Text-to-speech: Windows SAPI / macOS NSSpeech / Linux espeak (all offline)
+# pyttsx3>=2.90
+
+# Install all voice deps in one shot:
+#   pip install faster-whisper sounddevice soundfile keyboard pyttsx3

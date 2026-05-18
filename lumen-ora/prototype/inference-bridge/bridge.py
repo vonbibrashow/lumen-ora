@@ -406,6 +406,14 @@ async def run_inference(request: InferenceRequest) -> InferenceResponse:
             result = {"error": str(exc)}
             log.error("Session %s — tool %s error: %s", request.session_id, tool_name, exc)
 
+        # Append truncation note for the model when run_command output was capped.
+        if tool_name == "run_command" and isinstance(result, dict) and result.get("truncated"):
+            n = result.get("lines_captured", 0)
+            result["truncation_note"] = (
+                f"[Note: output was truncated at {n} lines. "
+                "Ask the user if they want to see more.]"
+            )
+
         tool_results.append(call_result)
 
         # Feed tool result back using Qwen2.5 template so next pass sees full context.
@@ -506,6 +514,13 @@ async def stream_inference(request: InferenceRequest) -> AsyncIterator[dict[str,
         # Allow — execute tool and feed result back.
         try:
             result = dispatch_tool(tool_name, parameters)
+            # Append truncation note for the model when run_command output was capped.
+            if tool_name == "run_command" and isinstance(result, dict) and result.get("truncated"):
+                n = result.get("lines_captured", 0)
+                result["truncation_note"] = (
+                    f"[Note: output was truncated at {n} lines. "
+                    "Ask the user if they want to see more.]"
+                )
             yield {
                 "event": "tool_result",
                 "data": json.dumps({"tool": tool_name, "result": result}),

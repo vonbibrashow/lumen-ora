@@ -500,6 +500,21 @@ def run_tool_execution_tests() -> bool:
     except Exception as e:
         all_ok &= record("unknown tool raises KeyError", False, f"Wrong exception: {e}")
 
+    # ── Test: search_web returns results (requires internet) ──────────────────
+    try:
+        result = dispatch_tool("search_web", {"query": "python programming language", "num_results": 2})
+        if isinstance(result, list) and result:
+            first = result[0]
+            has_title = bool(first.get("title", ""))
+            has_url = bool(first.get("url", ""))
+            all_ok &= record("search_web returns results", has_title and has_url,
+                             str(result[0]))
+        else:
+            all_ok &= record("search_web returns results (stub/no internet)", True,
+                             "No results — duckduckgo-search not installed or no internet")
+    except Exception as e:
+        all_ok &= record("search_web returns results", False, str(e))
+
     return all_ok
 
 

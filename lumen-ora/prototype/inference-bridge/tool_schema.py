@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import time
 from pathlib import Path
 from typing import Any
 
@@ -32,6 +33,7 @@ class RunCommandParams(BaseModel):
     args: list[str] = Field(default_factory=list, description="Arguments to pass to the command.")
     cwd: str | None = Field(None, description="Working directory; defaults to home dir.")
     timeout_seconds: int = Field(30, description="Max seconds to wait for completion.")
+    max_output_lines: int = Field(200, description="Cap output at this many lines. Default: 200.")
 
 
 class SearchWebParams(BaseModel):
@@ -52,6 +54,8 @@ class CommandResult(BaseModel):
     stdout: str
     stderr: str
     exit_code: int
+    truncated: bool = False
+    lines_captured: int = 0
 
 
 class DirectoryEntry(BaseModel):
@@ -126,13 +130,17 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                     "type": "integer",
                     "description": "Max seconds to wait. Default: 30.",
                 },
+                "max_output_lines": {
+                    "type": "integer",
+                    "description": "Cap output at this many lines. Default: 200.",
+                },
             },
             "required": ["command"],
         },
     },
     {
         "name": "search_web",
-        "description": "Search the web for a query. Returns a list of {title, url, snippet} results. (Currently a stub.)",
+        "description": "Search the web for a query via DuckDuckGo. Returns a list of {title, url, snippet} results.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -188,30 +196,122 @@ def execute_write_file(params: WriteFileParams) -> bool:
 
 
 def execute_run_command(params: RunCommandParams) -> CommandResult:
-    """Run a subprocess and return stdout/stderr/exit_code."""
+    """
+    Run a subprocess line-by-line via Popen (merged stdout+stderr).
+    Caps output at max_output_lines lines and respects timeout_seconds.
+    Returns a CommandResult with truncated/lines_captured fields.
+    """
     cwd = params.cwd or str(Path.home())
+    max_lines = params.max_output_lines
+    deadline = time.monotonic() + params.timeout_seconds
+
     try:
-        result = subprocess.run(
+        proc = subprocess.Popen(
             [params.command, *params.args],
             cwd=cwd,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
             text=True,
-            timeout=params.timeout_seconds,
+            encoding="utf-8",
+            errors="replace",
         )
-        return CommandResult(
-            stdout=result.stdout,
-            stderr=result.stderr,
-            exit_code=result.returncode,
-        )
-    except subprocess.TimeoutExpired:
-        return CommandResult(stdout="", stderr="Command timed out.", exit_code=-1)
     except FileNotFoundError:
-        return CommandResult(stdout="", stderr=f"Command not found: {params.command}", exit_code=127)
+        return CommandResult(
+            stdout="",
+            stderr=f"Command not found: {params.command}",
+            exit_code=127,
+            truncated=False,
+            lines_captured=0,
+        )
+
+    captured_lines: list[str] = []
+    truncated = False
+
+    try:
+        for line in proc.stdout:  # type: ignore[union-attr]
+            if time.monotonic() >= deadline:
+                # Timeout — kill and mark
+                proc.kill()
+                captured_lines.append("\n[timed out]")
+                proc.wait()
+                return CommandResult(
+                    stdout="".join(captured_lines),
+                    stderr="",
+                    exit_code=-1,
+                    truncated=truncated,
+                    lines_captured=len(captured_lines),
+                )
+
+            if len(captured_lines) < max_lines:
+                captured_lines.append(line)
+            else:
+                # Count remaining lines for the truncation note
+                remaining = sum(1 for _ in proc.stdout)  # type: ignore[union-attr]
+                truncated = True
+                extra = remaining + 1  # +1 for the current line we didn't store
+                captured_lines.append(f"... {extra} more lines\n")
+                break
+
+        # Wait for process to exit (it may still be running if we broke early)
+        try:
+            remaining_timeout = max(0.0, deadline - time.monotonic())
+            proc.wait(timeout=remaining_timeout)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+            captured_lines.append("\n[timed out]")
+            return CommandResult(
+                stdout="".join(captured_lines),
+                stderr="",
+                exit_code=-1,
+                truncated=truncated,
+                lines_captured=len(captured_lines),
+            )
+
+    except Exception:
+        proc.kill()
+        proc.wait()
+        raise
+
+    return CommandResult(
+        stdout="".join(captured_lines),
+        stderr="",
+        exit_code=proc.returncode,
+        truncated=truncated,
+        lines_captured=len(captured_lines),
+    )
 
 
 def execute_search_web(params: SearchWebParams) -> list[WebResult]:
-    """Stub — returns empty results until a search backend is integrated."""
-    return []
+    """Search the web via DuckDuckGo (no API key required)."""
+    try:
+        from ddgs import DDGS  # current package name
+    except ImportError:
+        try:
+            from duckduckgo_search import DDGS  # legacy name fallback
+        except ImportError:
+            return [WebResult(
+                title="search_web unavailable",
+                url="",
+                snippet="Install with: pip install ddgs"
+            )]
+
+    results = []
+    try:
+        with DDGS() as ddgs:
+            for r in ddgs.text(params.query, max_results=params.num_results):
+                results.append(WebResult(
+                    title=r.get("title", ""),
+                    url=r.get("href", ""),
+                    snippet=r.get("body", ""),
+                ))
+    except Exception as exc:
+        results.append(WebResult(
+            title="Search error",
+            url="",
+            snippet=str(exc),
+        ))
+    return results
 
 
 def execute_list_directory(params: ListDirectoryParams) -> list[DirectoryEntry]:

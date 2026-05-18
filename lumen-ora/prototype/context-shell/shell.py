@@ -6,6 +6,7 @@ The user-facing AI interface. Everything you type goes to the AI.
 Usage:
     python shell.py           # interactive mode
     python shell.py --check   # connectivity check, exit 0/1
+    python shell.py --voice   # enable voice mode (STT + TTS)
 """
 
 from __future__ import annotations
@@ -15,6 +16,7 @@ import json
 import os
 import sys
 import textwrap
+import threading
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -48,6 +50,50 @@ except ImportError:
     sys.exit(1)
 
 # ---------------------------------------------------------------------------
+# Optional voice deps — all guarded; shell works without them
+# ---------------------------------------------------------------------------
+
+_VOICE_DEPS_OK = False
+_VOICE_MISSING: list[str] = []
+
+try:
+    import sounddevice as _sd  # noqa: F401
+    _SD_OK = True
+except ImportError:
+    _SD_OK = False
+    _VOICE_MISSING.append("sounddevice")
+
+try:
+    import soundfile as _sf  # noqa: F401
+    _SF_OK = True
+except ImportError:
+    _SF_OK = False
+    _VOICE_MISSING.append("soundfile")
+
+try:
+    import keyboard as _keyboard_mod  # noqa: F401
+    _KB_OK = True
+except ImportError:
+    _KB_OK = False
+    _VOICE_MISSING.append("keyboard")
+
+try:
+    from faster_whisper import WhisperModel as _WhisperModel  # noqa: F401
+    _WHISPER_OK = True
+except ImportError:
+    _WHISPER_OK = False
+    _VOICE_MISSING.append("faster-whisper")
+
+try:
+    import pyttsx3 as _pyttsx3_mod  # noqa: F401
+    _PYTTSX3_OK = True
+except ImportError:
+    _PYTTSX3_OK = False
+    _VOICE_MISSING.append("pyttsx3")
+
+_VOICE_DEPS_OK = not _VOICE_MISSING
+
+# ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
@@ -65,9 +111,18 @@ MAX_CONTEXT_TURNS = 10   # how many prior turns to send as context to the model
 MAX_TOOL_RESULT_CHARS = 800
 
 PROMPT = "lumen ▶  "   # lumen ▶
+VOICE_PROMPT = "🎤 lumen ▶  "
 CONTINUATION = "   ... "    # multiline continuation marker
 
 MODEL_NAME = "Qwen2.5-7B"
+
+# Voice config
+LUMEN_WHISPER_MODEL = os.environ.get("LUMEN_WHISPER_MODEL", "base.en")
+LUMEN_TTS_ENABLED = os.environ.get("LUMEN_TTS", "1").strip() not in ("0", "false", "no")
+
+# Audio recording settings
+_AUDIO_SAMPLE_RATE = 16000   # Hz — Whisper expects 16 kHz
+_AUDIO_CHANNELS = 1           # mono
 
 # ---------------------------------------------------------------------------
 # Console (stderr=False so we can redirect stdout cleanly if needed)
@@ -184,7 +239,7 @@ def check_policy() -> tuple[bool, str]:
 # Startup banner
 # ---------------------------------------------------------------------------
 
-def print_banner(bridge_ok: bool, policy_ok: bool) -> None:
+def print_banner(bridge_ok: bool, policy_ok: bool, voice_mode: bool = False) -> None:
     bridge_status = (
         _green("Bridge: connected") if bridge_ok else _red("Bridge: not running")
     )
@@ -204,7 +259,10 @@ def print_banner(bridge_ok: bool, policy_ok: bool) -> None:
     console.print(
         f"{policy_status}  [dim]|[/dim]  {bridge_status}  [dim]|[/dim]  {model_status}"
     )
-    console.print("[dim]Type anything. /help for commands.[/dim]")
+    if voice_mode:
+        console.print("[dim]Hold Space to speak / press Enter to type. /help for commands.[/dim]")
+    else:
+        console.print("[dim]Type anything. /help for commands.[/dim]")
     console.print(f"[dim]{divider}[/dim]")
     console.print()
 
@@ -244,10 +302,11 @@ def _truncate(s: str, max_chars: int = MAX_TOOL_RESULT_CHARS) -> str:
     return s[:max_chars] + f"\n[dim]… ({len(s) - max_chars} more chars)[/dim]"
 
 
-def render_response(data: dict) -> bool:
+def render_response(data: dict) -> tuple[bool, str]:
     """
     Render the bridge response.
-    Returns True if a RequireConfirmation was found (caller should re-confirm).
+    Returns (require_confirmation, prose_text).
+    prose_text is the AI's prose text only (suitable for TTS); tool panels excluded.
     """
     text: str = data.get("text", "")
     tool_calls: list = data.get("tool_calls", [])
@@ -256,11 +315,13 @@ def render_response(data: dict) -> bool:
     finish_reason: str = data.get("finish_reason", "stop")
 
     # --- Prose text ---
+    prose_text = ""
     if text.strip():
         width = (console.width or 80) - 4
         wrapped = textwrap.fill(text.strip(), width=width)
         console.print()
         console.print(wrapped)
+        prose_text = text.strip()
 
     # --- Tool call results ---
     for tc in tool_calls:
@@ -335,26 +396,212 @@ def render_response(data: dict) -> bool:
             console.print(_red(f"\nPolicy blocked: {reason}"))
 
     console.print()
-    return False
+    return False, prose_text
+
+
+# ---------------------------------------------------------------------------
+# Voice subsystem
+# ---------------------------------------------------------------------------
+
+class VoiceEngine:
+    """
+    Manages STT (faster-whisper) and TTS (pyttsx3).
+    All methods are no-ops when voice deps are unavailable.
+    """
+
+    def __init__(self) -> None:
+        self._whisper: object = None
+        self._tts_engine: object = None
+        self._tts_lock = threading.Lock()
+        self._recording = False
+        self._audio_frames: list = []
+
+    # ------------------------------------------------------------------
+    # Lazy init
+    # ------------------------------------------------------------------
+
+    def _ensure_whisper(self) -> bool:
+        if not _WHISPER_OK:
+            return False
+        if self._whisper is None:
+            from faster_whisper import WhisperModel
+            console.print(_dim(f"[voice] Loading Whisper model '{LUMEN_WHISPER_MODEL}'…"))
+            self._whisper = WhisperModel(
+                LUMEN_WHISPER_MODEL,
+                device="cpu",
+                compute_type="int8",
+            )
+            console.print(_dim("[voice] Whisper ready."))
+        return True
+
+    def _ensure_tts(self) -> bool:
+        if not _PYTTSX3_OK:
+            return False
+        if self._tts_engine is None:
+            import pyttsx3
+            self._tts_engine = pyttsx3.init()
+            # Sensible defaults for Windows SAPI
+            self._tts_engine.setProperty("rate", 175)
+        return True
+
+    # ------------------------------------------------------------------
+    # Push-to-talk recording
+    # ------------------------------------------------------------------
+
+    def start_recording(self) -> bool:
+        """Begin capturing audio from the default mic. Returns False if unavailable."""
+        if not (_SD_OK and _SF_OK):
+            return False
+        import sounddevice as sd
+
+        self._audio_frames = []
+        self._recording = True
+
+        def _callback(indata, frames, time, status):
+            if self._recording:
+                self._audio_frames.append(indata.copy())
+
+        self._stream = sd.InputStream(
+            samplerate=_AUDIO_SAMPLE_RATE,
+            channels=_AUDIO_CHANNELS,
+            dtype="float32",
+            callback=_callback,
+        )
+        self._stream.start()
+        return True
+
+    def stop_recording(self) -> "np.ndarray | None":
+        """Stop recording and return the audio array (float32, 16 kHz mono)."""
+        self._recording = False
+        if not hasattr(self, "_stream"):
+            return None
+        try:
+            self._stream.stop()
+            self._stream.close()
+        except Exception:
+            pass
+        if not self._audio_frames:
+            return None
+        import numpy as np
+        audio = np.concatenate(self._audio_frames, axis=0)
+        return audio.flatten()
+
+    # ------------------------------------------------------------------
+    # Transcription
+    # ------------------------------------------------------------------
+
+    def transcribe(self, audio_array: "np.ndarray") -> str:
+        """Transcribe audio array to text. Returns '' on failure."""
+        if not self._ensure_whisper():
+            return ""
+        try:
+            segments, _info = self._whisper.transcribe(
+                audio_array,
+                beam_size=5,
+                language="en",
+                condition_on_previous_text=False,
+            )
+            text = " ".join(seg.text.strip() for seg in segments).strip()
+            return text
+        except Exception as exc:
+            console.print(_red(f"[voice] Transcription error: {exc}"))
+            return ""
+
+    # ------------------------------------------------------------------
+    # Text-to-speech
+    # ------------------------------------------------------------------
+
+    def speak(self, text: str) -> None:
+        """Speak text using pyttsx3. No-op if TTS disabled or unavailable."""
+        if not LUMEN_TTS_ENABLED:
+            return
+        if not self._ensure_tts():
+            return
+
+        # Run TTS in a background thread so it doesn't block the REPL
+        def _speak():
+            with self._tts_lock:
+                try:
+                    self._tts_engine.say(text)
+                    self._tts_engine.runAndWait()
+                except Exception as exc:
+                    console.print(_red(f"[voice] TTS error: {exc}"))
+
+        t = threading.Thread(target=_speak, daemon=True)
+        t.start()
+
+    # ------------------------------------------------------------------
+    # Push-to-talk: blocking record-until-Space-released
+    # ------------------------------------------------------------------
+
+    def push_to_talk(self) -> str:
+        """
+        Record audio while Space is held; transcribe on release.
+        Returns transcribed text, or '' if nothing usable.
+        Requires keyboard + sounddevice + soundfile + faster-whisper.
+        """
+        if not (_KB_OK and _SD_OK and _SF_OK and _WHISPER_OK):
+            return ""
+
+        import keyboard
+
+        console.print(_dim("  [recording…] Release Space when done."), end="\r")
+
+        ok = self.start_recording()
+        if not ok:
+            return ""
+
+        # Block until Space key is released
+        keyboard.wait("space", suppress=True, trigger_on_release=True)
+
+        audio = self.stop_recording()
+        console.print(" " * 60, end="\r")  # clear the recording line
+
+        if audio is None or len(audio) < _AUDIO_SAMPLE_RATE * 0.3:
+            # Less than 300 ms of audio — ignore (likely accidental tap)
+            console.print(_dim("  (recording too short, ignored)"))
+            return ""
+
+        console.print(_dim("  [transcribing…]"), end="\r")
+        text = self.transcribe(audio)
+        console.print(" " * 60, end="\r")  # clear the transcribing line
+
+        if text:
+            console.print(f"  [dim]You said:[/dim] {text}")
+        return text
+
+
+# Module-level singleton — created lazily on first voice use
+_voice_engine: VoiceEngine | None = None
+
+
+def _get_voice_engine() -> VoiceEngine:
+    global _voice_engine
+    if _voice_engine is None:
+        _voice_engine = VoiceEngine()
+    return _voice_engine
 
 
 # ---------------------------------------------------------------------------
 # Special / commands
 # ---------------------------------------------------------------------------
 
-def cmd_help() -> None:
+def cmd_help(voice_mode: bool = False) -> None:
+    lines = [
+        "[bold]/help[/bold]       — show this help",
+        "[bold]/exit[/bold]       — exit the shell (also Ctrl+D)",
+        "[bold]/quit[/bold]       — exit the shell",
+        "[bold]/clear[/bold]      — clear screen and reset display",
+        "[bold]/new[/bold]        — start a fresh conversation (clears context)",
+        "[bold]/history[/bold]    — show last 10 exchanges",
+        "[bold]/session[/bold]    — show session ID and history stats",
+        "[bold]/model[/bold]      — show which model is loaded",
+        "[bold]/voice on[/bold]   — enable voice mode (STT + TTS)",
+        "[bold]/voice off[/bold]  — disable voice mode",
+    ]
     console.print(
         Panel(
-            "\n".join([
-                "[bold]/help[/bold]       — show this help",
-                "[bold]/exit[/bold]       — exit the shell (also Ctrl+D)",
-                "[bold]/quit[/bold]       — exit the shell",
-                "[bold]/clear[/bold]      — clear screen and reset display",
-                "[bold]/new[/bold]        — start a fresh conversation (clears context)",
-                "[bold]/history[/bold]    — show last 10 exchanges",
-                "[bold]/session[/bold]    — show session ID and history stats",
-                "[bold]/model[/bold]      — show which model is loaded",
-            ]),
+            "\n".join(lines),
             title="[cyan]Lumen Ora — Commands[/cyan]",
             border_style="cyan",
             box=box.ROUNDED,
@@ -392,10 +639,16 @@ def cmd_session(session_id: str, conversation: list[dict]) -> None:
     console.print(f"History:     [cyan]{len(entries)}[/cyan] turns on disk  ({HISTORY_FILE})")
 
 
-def handle_special(cmd: str, session_id: str = "", conversation: list[dict] | None = None) -> bool:
+def handle_special(
+    cmd: str,
+    session_id: str = "",
+    conversation: list[dict] | None = None,
+    voice_state: dict | None = None,
+) -> bool:
     """
     Handle /commands. Return True if handled (caller should not send to AI).
     Return False if not a special command.
+    voice_state is a mutable dict with key 'enabled' (bool).
     """
     stripped = cmd.strip()
     if not stripped.startswith("/"):
@@ -403,6 +656,7 @@ def handle_special(cmd: str, session_id: str = "", conversation: list[dict] | No
 
     parts = stripped.split(None, 1)
     verb = parts[0].lower()
+    rest = parts[1].strip() if len(parts) > 1 else ""
 
     if verb in ("/exit", "/quit"):
         console.print("[dim]Goodbye.[/dim]")
@@ -431,7 +685,34 @@ def handle_special(cmd: str, session_id: str = "", conversation: list[dict] | No
         return True
 
     if verb == "/help":
-        cmd_help()
+        cmd_help(voice_state.get("enabled", False) if voice_state else False)
+        return True
+
+    if verb == "/voice":
+        if voice_state is None:
+            console.print(_dim("/voice requires an active shell session."))
+            return True
+        if rest == "on":
+            if not _VOICE_DEPS_OK:
+                console.print(
+                    _red(
+                        "Voice mode unavailable — missing packages: "
+                        + ", ".join(_VOICE_MISSING)
+                        + "\nRun: pip install faster-whisper sounddevice soundfile keyboard pyttsx3"
+                    )
+                )
+            else:
+                voice_state["enabled"] = True
+                console.print(_green("Voice mode enabled. Hold Space to speak."))
+        elif rest == "off":
+            voice_state["enabled"] = False
+            console.print(_dim("Voice mode disabled."))
+        else:
+            status = "on" if voice_state.get("enabled") else "off"
+            console.print(
+                f"Voice mode is currently [bold]{status}[/bold]. "
+                "Use [bold]/voice on[/bold] or [bold]/voice off[/bold]."
+            )
         return True
 
     # Unknown slash command — let the AI handle it (return False)
@@ -446,7 +727,6 @@ def infer_with_spinner(prompt: str, session_id: str, messages: list[dict]) -> di
     result: dict = {}
     error_info: list[Exception] = []
 
-    import threading
     spinner_done = threading.Event()
 
     def _infer():
@@ -474,33 +754,99 @@ def infer_with_spinner(prompt: str, session_id: str, messages: list[dict]) -> di
     return result
 
 # ---------------------------------------------------------------------------
+# Voice-aware input
+# ---------------------------------------------------------------------------
+
+def _read_voice_or_text(voice_state: dict, prompt_str: str) -> str | None:
+    """
+    Read user input.
+    - In voice mode: waits for either a Space keydown (→ push-to-talk) or any
+      other key (→ falls through to normal text input).
+    - In text mode (or when voice deps unavailable): plain input().
+    Returns the input string, or None to re-prompt (e.g. after Ctrl+C).
+    Raises EOFError when the user signals end-of-file (Ctrl+D).
+    """
+    if not voice_state.get("enabled") or not _VOICE_DEPS_OK:
+        try:
+            return input(prompt_str)
+        except EOFError:
+            raise
+        except KeyboardInterrupt:
+            console.print()
+            return None
+
+    # --- Voice mode ---
+    import keyboard
+
+    # Print the prompt without a newline so it appears inline.
+    sys.stdout.write(prompt_str)
+    sys.stdout.flush()
+
+    try:
+        event = keyboard.read_event(suppress=False)
+        if event.event_type == "down" and event.name == "space":
+            # Clear the prompt line
+            sys.stdout.write("\r" + " " * (len(prompt_str) + 2) + "\r")
+            sys.stdout.flush()
+            ve = _get_voice_engine()
+            text = ve.push_to_talk()
+            return text if text else ""
+        else:
+            # A non-Space key was pressed; clear and fall back to normal input
+            sys.stdout.write("\r" + " " * (len(prompt_str) + 2) + "\r")
+            sys.stdout.flush()
+            return input(prompt_str)
+    except EOFError:
+        raise
+    except KeyboardInterrupt:
+        console.print()
+        return None
+    except Exception:
+        # keyboard module failed or unavailable at runtime — fall back
+        try:
+            return input(prompt_str)
+        except EOFError:
+            raise
+        except KeyboardInterrupt:
+            console.print()
+            return None
+
+
+# ---------------------------------------------------------------------------
 # REPL
 # ---------------------------------------------------------------------------
 
-def repl(session_id: str) -> None:
+def repl(session_id: str, start_voice: bool = False) -> None:
     """Main read-eval-print loop."""
     # In-memory conversation for multi-turn context (trimmed to MAX_CONTEXT_TURNS)
     conversation: list[dict] = []
 
+    # Mutable voice state — passed to handle_special so /voice on/off works
+    voice_state: dict = {"enabled": start_voice and _VOICE_DEPS_OK}
+
     while True:
+        active_voice = voice_state.get("enabled", False)
+        prompt_str = VOICE_PROMPT if active_voice else PROMPT
+
         # --- Read ---
         try:
-            line = input(PROMPT)
+            line = _read_voice_or_text(voice_state, prompt_str)
         except EOFError:
             console.print()
             console.print("[dim]Goodbye.[/dim]")
             break
-        except KeyboardInterrupt:
-            console.print()
+
+        if line is None:
+            # KeyboardInterrupt — re-prompt
             continue
 
         # Empty input — re-prompt
         if not line.strip():
             continue
 
-        # Multiline: lines ending with backslash continue
+        # Multiline: lines ending with backslash continue (text-only convenience)
         accumulated = line
-        while accumulated.rstrip().endswith("\\"):
+        while accumulated.rstrip().endswith("\\") and not voice_state.get("enabled"):
             accumulated = accumulated.rstrip()[:-1] + "\n"
             try:
                 more = input(CONTINUATION)
@@ -516,7 +862,7 @@ def repl(session_id: str) -> None:
             continue
 
         # --- Special commands ---
-        if handle_special(user_input, session_id, conversation):
+        if handle_special(user_input, session_id, conversation, voice_state):
             continue
 
         # --- Send to AI (with rolling conversation context) ---
@@ -542,7 +888,12 @@ def repl(session_id: str) -> None:
             continue
 
         # --- Render ---
-        render_response(data)
+        _require_confirm, prose_text = render_response(data)
+
+        # --- TTS (voice mode only; prose only, never tool JSON) ---
+        if voice_state.get("enabled") and prose_text:
+            ve = _get_voice_engine()
+            ve.speak(prose_text)
 
         # --- Update in-memory conversation context ---
         ai_text = data.get("text", "")
@@ -606,10 +957,31 @@ def main() -> None:
         action="store_true",
         help="Verify connectivity to bridge and policy engine, then exit.",
     )
+    parser.add_argument(
+        "--voice",
+        action="store_true",
+        help="Enable voice mode at startup (push-to-talk STT + TTS).",
+    )
     args = parser.parse_args()
 
     if args.check:
         sys.exit(run_check())
+
+    # --- Voice mode startup validation ---
+    start_voice = args.voice
+    if start_voice and not _VOICE_DEPS_OK:
+        console.print(
+            _red(
+                "Voice mode unavailable — missing packages: "
+                + ", ".join(_VOICE_MISSING)
+            )
+        )
+        console.print(
+            "[dim]Run: pip install faster-whisper sounddevice soundfile keyboard pyttsx3[/dim]"
+        )
+        console.print("[dim]Continuing in text-only mode.[/dim]")
+        console.print()
+        start_voice = False
 
     # --- Normal interactive mode ---
     session_id = load_or_create_session_id()
@@ -617,7 +989,13 @@ def main() -> None:
     bridge_ok, _ = check_bridge()
     policy_ok, _ = check_policy()
 
-    print_banner(bridge_ok, policy_ok)
+    print_banner(bridge_ok, policy_ok, voice_mode=start_voice)
+
+    if start_voice:
+        console.print(
+            "[dim]Voice mode active. Hold Space to speak, or just type and press Enter.[/dim]"
+        )
+        console.print()
 
     if not bridge_ok:
         console.print(
@@ -629,7 +1007,7 @@ def main() -> None:
         )
 
     try:
-        repl(session_id)
+        repl(session_id, start_voice=start_voice)
     except KeyboardInterrupt:
         console.print()
         console.print("[dim]Goodbye.[/dim]")
