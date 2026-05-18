@@ -1,0 +1,24 @@
+[package]
+name = "policy-engine"
+version = "0.1.0"
+edition = "2021"
+description = "Lumen Ora Policy Engine — intercepts AI tool calls and enforces security rules"
+
+[[bin]]
+name = "policy-engine"
+path = "src/main.rs"
+
+[lib]
+name = "policy_engine"
+path = "src/lib.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+regex = "1"
+
+[dev-dependencies]
+tokio-test = "0.4"
