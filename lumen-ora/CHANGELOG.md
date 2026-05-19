@@ -11,6 +11,60 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [0.4.0-beta] — 2026-05-19
+
+### Added
+
+- **Tailscale remote access** — `LUMEN_BIND_HOST=0.0.0.0` makes the bridge listen on all
+  interfaces (including the Tailscale interface) so you can reach the dashboard from a phone
+  or remote machine on your tailnet; 5-step recipe in README and INSTALL.md
+- **Mobile-responsive dashboard** — `viewport-fit=cover`, Apple PWA hints, `100dvh` layout,
+  safe-area insets, 16 px input font (prevents iOS auto-zoom), 44 px touch targets; sidebar
+  hides on screens ≤ 768 px; special-cased 390 px (iPhone 13 mini class)
+- **Cross-platform clipboard** — `clipboard_read`/`clipboard_write` use `pyperclip` on
+  Linux/macOS (auto-detects pbcopy/xclip/xsel); Windows path unchanged
+- **Cross-platform screenshot** — `take_screenshot` now uses `mss` as the primary backend
+  on all OSes; `PIL.ImageGrab` retained as a Windows-only fallback
+- **Cross-platform push-to-talk** — `pynput` backend on Linux/macOS (no root required);
+  `keyboard` module kept on Windows; graceful fallback if neither is available
+- **Bearer-token auth** — `LUMEN_API_TOKEN` env var; when set, the bridge enforces
+  `Authorization: Bearer <token>` on `/infer`, `/infer-stream`, and `/evaluate_tool`;
+  unset = no auth (back-compat); shell and dashboard both send the token automatically
+- **CI matrix** — GitHub Actions now runs the test suite on `windows-latest`,
+  `ubuntu-latest`, and `macos-latest`
+- **Top-level install entry points** — `install.bat` (double-click) and `install.ps1`
+  (PowerShell, supports `-SkipConfirm`) at the repo root wrap `prototype/setup.ps1`
+- **INSTALL.md** — comprehensive install guide: requirements, step-by-step, manual path,
+  Tailscale recipe, troubleshooting, uninstall, where-things-live reference
+- **60-test end-to-end suite** — Layer 3b (8 bearer-auth tests), Layer 3c (5 remote-bind /
+  Tailscale tests) added on top of existing 47 tests
+
+### Fixed
+
+- `.gitattributes` added: `*.bat`/`*.ps1` forced to CRLF, `*.sh` forced to LF — prevents
+  cmd.exe "fails silently" bug caused by LF-only batch files
+
+---
+
+## [0.3.0] — 2026-05-19
+
+### Added
+
+- **Public README** — demo session, ASCII architecture diagram, quick-start, 10-tool table,
+  input-mode table, `/command` reference, requirements table, project layout, roadmap
+- **CHANGELOG** (this file) — Keep-a-Changelog format, semver, compare links
+- **GitHub Actions CI** — `test.yml` runs on every push/PR (`windows-latest`, Python 3.11);
+  `release.yml` triggers on `v*` tags and publishes a Windows zip artifact as a GitHub Release
+  (alpha/beta tags marked as pre-release)
+- **Setup installer** — `prototype/setup.ps1`: prereq checks, `pip install`, WSL2 cargo build,
+  optional model downloads (7B + 3B GGUF), final status report; idempotent
+- **Web dashboard** — single-file dark-theme UI at `http://localhost:8765` with SSE streaming
+  chat, tool-call cards, policy badge, tool-log sidebar, model tier toggle
+- **Plugin system** — bridge scans `~/.lumen/tools/*.py` for `PLUGIN_TOOLS` lists; ships
+  `example_plugin.py` template; plugins appear in `/tools` and are callable by the model
+
+---
+
 ## [0.2.0] — 2026-05-19
 
 ### Added
@@ -97,6 +151,8 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ---
 
-[Unreleased]: https://github.com/vonbibrashow/lumen-ora/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/vonbibrashow/lumen-ora/compare/v0.4.0-beta...HEAD
+[0.4.0-beta]: https://github.com/vonbibrashow/lumen-ora/compare/v0.3.0...v0.4.0-beta
+[0.3.0]: https://github.com/vonbibrashow/lumen-ora/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/vonbibrashow/lumen-ora/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/vonbibrashow/lumen-ora/releases/tag/v0.1.0

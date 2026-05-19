@@ -1,5 +1,9 @@
 # Lumen Ora
 
+[![Tests](https://github.com/vonbibrashow/lumen-ora/actions/workflows/test.yml/badge.svg)](https://github.com/vonbibrashow/lumen-ora/actions/workflows/test.yml)
+[![Release](https://img.shields.io/github/v/release/vonbibrashow/lumen-ora?include_prereleases)](https://github.com/vonbibrashow/lumen-ora/releases)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 > A locally-run AI operating system interface — voice, gestures, tools, and a safety policy engine, all on your own hardware.
 
 ## What it is
@@ -220,7 +224,7 @@ lumen-ora/
 │   ├── start.bat              # One-click launcher (Command Prompt)
 │   ├── start.ps1              # One-click launcher (PowerShell)
 │   ├── setup.ps1              # Installer: llama.cpp, model, Python deps
-│   └── test_e2e.py            # 47-test end-to-end suite
+│   └── test_e2e.py            # 60-test end-to-end suite
 ├── docs/
 │   ├── architecture/          # seL4/Genode design docs, policy model spec
 │   ├── inference/             # Runtime design, tool schema spec
@@ -233,10 +237,11 @@ lumen-ora/
 
 | Phase | Status | Scope |
 |-------|--------|-------|
-| Foundation (Milestone 0) | Done | Policy engine + inference bridge + context shell; 47-test suite passing |
-| Alpha (Milestone 1) | Done | Voice I/O, camera gestures, long-term memory, fast/smart model switching, 10 tools |
-| Beta (Milestone 2) | In progress | Setup.ps1 installer, NPU acceleration, reproducible builds, hardware test matrix |
-| OS-level (Phase 2+) | Future | seL4/Genode kernel integration, formally verified policy layer, native Lumen Ora apps |
+| Phase 1 — Personal Alpha | ✅ Done | Policy engine, inference bridge, context shell; 10 tools; voice I/O; camera gestures; long-term memory; fast/smart model switching; 47-test suite |
+| Phase 2 — Personal Beta | ✅ Done | `setup.ps1` installer, web dashboard, plugin system (`~/.lumen/tools/*.py`) |
+| Phase 3 — Public Alpha | ✅ Done | Public README, CHANGELOG, GitHub Actions CI/CD (`test.yml` + `release.yml`) |
+| Phase 4 — Public Beta | ✅ Done | Bearer-token auth, Tailscale remote access, mobile-responsive dashboard, cross-platform tools (Linux/macOS), CI matrix (Windows + Linux + macOS); 60-test suite |
+| Phase 5 — OS Integration | Future | seL4/Genode kernel integration, formally verified policy layer, native Lumen Ora apps, NPU acceleration |
 
 The long-term vision is an OS where the AI layer is not bolted on top — it is the shell, with direct access to hardware, memory, and the file system through a formally verified policy layer. The prototype proves the concept on Windows/WSL2 today; the seL4/Genode architecture is the production target.
 
