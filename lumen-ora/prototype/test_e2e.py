@@ -519,6 +519,72 @@ def run_tool_execution_tests() -> bool:
 
 
 # ===========================================================================
+# LAYER 2b: Voice subsystem tests (pure Python, no hardware required)
+# ===========================================================================
+
+def run_voice_tests() -> bool:
+    """
+    Test the voice subsystem dependencies and model loading.
+    No microphone or speaker hardware is required — we only verify imports
+    and (if the model is already cached) attempt a WhisperModel init.
+    """
+    section("LAYER 2b — Voice Subsystem")
+
+    all_ok = True
+
+    # ── faster-whisper import ─────────────────────────────────────────────────
+    try:
+        import faster_whisper  # noqa: F401
+        fw_ok = True
+        record("faster-whisper importable", True)
+    except ImportError as e:
+        fw_ok = False
+        record("faster-whisper importable", False,
+               f"{e} — run: pip install faster-whisper")
+
+    # ── pyttsx3 import ────────────────────────────────────────────────────────
+    try:
+        import pyttsx3  # noqa: F401
+        record("pyttsx3 importable", True)
+    except ImportError as e:
+        record("pyttsx3 importable", False,
+               f"{e} — run: pip install pyttsx3")
+
+    # ── sounddevice import ────────────────────────────────────────────────────
+    try:
+        import sounddevice  # noqa: F401
+        record("sounddevice importable", True)
+    except ImportError as e:
+        record("sounddevice importable", False,
+               f"{e} — run: pip install sounddevice")
+
+    # ── WhisperModel load (only if cache already present) ────────────────────
+    if fw_ok:
+        hf_hub_cache = Path.home() / ".cache" / "huggingface" / "hub"
+        cache_hit = False
+        if hf_hub_cache.exists():
+            cache_hit = any(
+                "whisper" in p.name.lower()
+                for p in hf_hub_cache.iterdir()
+                if p.is_dir()
+            )
+
+        if cache_hit:
+            try:
+                from faster_whisper import WhisperModel
+                _m = WhisperModel("base.en", device="cpu", compute_type="int8")
+                record("WhisperModel('base.en') loads from cache", True)
+            except Exception as exc:
+                all_ok &= record("WhisperModel('base.en') loads from cache", False, str(exc))
+        else:
+            # Model not cached — skip rather than trigger a 150 MB download in CI
+            print(f"  [{yellow('SKIP')}] WhisperModel load — model not cached "
+                  f"(~/.cache/huggingface/hub has no whisper dir)")
+
+    return all_ok
+
+
+# ===========================================================================
 # LAYER 3: Inference Bridge HTTP tests (requires bridge running, NOT model)
 # ===========================================================================
 
@@ -912,6 +978,9 @@ Examples:
 
         # Layer 2: Tool execution (pure Python, no deps needed beyond pydantic)
         run_tool_execution_tests()
+
+        # Layer 2b: Voice subsystem (import checks + cached model load)
+        run_voice_tests()
 
         if not args.skip_bridge:
             # Layer 3: Inference bridge

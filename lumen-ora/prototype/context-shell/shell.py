@@ -268,6 +268,41 @@ def ensure_policy_engine() -> bool:
 def ensure_lumen_dir() -> None:
     LUMEN_DIR.mkdir(parents=True, exist_ok=True)
 
+
+# ---------------------------------------------------------------------------
+# Whisper model pre-download / cache warm-up
+# ---------------------------------------------------------------------------
+
+def ensure_whisper_model() -> None:
+    """
+    Pre-download the Whisper model so it is cached before the REPL starts.
+    Call this at startup when --voice is passed.
+    faster-whisper caches models in ~/.cache/huggingface/hub.
+    """
+    if not _WHISPER_OK:
+        return
+
+    # Check whether the model directory already exists in the HF cache
+    hf_hub_cache = Path.home() / ".cache" / "huggingface" / "hub"
+    cache_exists = hf_hub_cache.exists() and any(
+        p.name.lower().startswith("whisper") or "whisper" in p.name.lower()
+        for p in hf_hub_cache.iterdir()
+        if p.is_dir()
+    ) if hf_hub_cache.exists() else False
+
+    if not cache_exists:
+        console.print(_dim("  Whisper model: downloading..."))
+
+    try:
+        from faster_whisper import WhisperModel
+        _model = WhisperModel(LUMEN_WHISPER_MODEL, device="cpu", compute_type="int8")
+        # Store on the global voice engine singleton so it is reused
+        engine = _get_voice_engine()
+        engine._whisper = _model
+        console.print(_dim("  Whisper model: ready"))
+    except Exception as exc:
+        console.print(_red(f"  Whisper model: failed to load ({exc})"))
+
 # ---------------------------------------------------------------------------
 # Session ID — persisted across restarts
 # ---------------------------------------------------------------------------
@@ -534,7 +569,7 @@ class VoiceEngine:
     """
 
     def __init__(self) -> None:
-        self._whisper: object = None
+        self._whisper: object = None          # WhisperModel instance (reused across PTT calls)
         self._tts_engine: object = None
         self._tts_lock = threading.Lock()
         self._recording = False
@@ -569,6 +604,27 @@ class VoiceEngine:
         return True
 
     # ------------------------------------------------------------------
+    # Audio device helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def list_audio_devices() -> str:
+        """Return a compact summary string of available audio input devices."""
+        if not _SD_OK:
+            return "(sounddevice not installed)"
+        try:
+            import sounddevice as sd
+            devices = sd.query_devices()
+            inputs = [
+                f"{i}: {d['name']}"
+                for i, d in enumerate(devices)
+                if d.get("max_input_channels", 0) > 0
+            ]
+            return ", ".join(inputs) if inputs else "(none found)"
+        except Exception as exc:
+            return f"(error querying devices: {exc})"
+
+    # ------------------------------------------------------------------
     # Push-to-talk recording
     # ------------------------------------------------------------------
 
@@ -585,13 +641,21 @@ class VoiceEngine:
             if self._recording:
                 self._audio_frames.append(indata.copy())
 
-        self._stream = sd.InputStream(
-            samplerate=_AUDIO_SAMPLE_RATE,
-            channels=_AUDIO_CHANNELS,
-            dtype="float32",
-            callback=_callback,
-        )
-        self._stream.start()
+        try:
+            self._stream = sd.InputStream(
+                samplerate=_AUDIO_SAMPLE_RATE,
+                channels=_AUDIO_CHANNELS,
+                dtype="float32",
+                callback=_callback,
+            )
+            self._stream.start()
+        except Exception:
+            self._recording = False
+            available = self.list_audio_devices()
+            console.print(
+                _red(f"No mic found. Available inputs: {available}")
+            )
+            return False
         return True
 
     def stop_recording(self) -> "np.ndarray | None":
@@ -663,23 +727,52 @@ class VoiceEngine:
         Record audio while Space is held; transcribe on release.
         Returns transcribed text, or '' if nothing usable.
         Requires keyboard + sounddevice + soundfile + faster-whisper.
+
+        Safety: recording is capped at 30 seconds to prevent accidental
+        indefinite holds.
         """
         if not (_KB_OK and _SD_OK and _SF_OK and _WHISPER_OK):
             return ""
 
         import keyboard
 
-        console.print(_dim("  [recording…] Release Space when done."), end="\r")
+        console.print(_dim("  [recording…] Release Space when done (max 30 s)."), end="\r")
 
         ok = self.start_recording()
         if not ok:
+            # start_recording already printed the error message
             return ""
 
-        # Block until Space key is released
-        keyboard.wait("space", suppress=True, trigger_on_release=True)
+        # Block until Space key is released, with a 30-second safety cap.
+        # keyboard.wait() has no built-in timeout; we use a daemon thread to
+        # enforce the cap by programmatically releasing the wait.
+        _MAX_RECORD_SECONDS = 30
+        _timed_out = [False]
+
+        def _timeout_guard():
+            import time
+            time.sleep(_MAX_RECORD_SECONDS)
+            if self._recording:
+                _timed_out[0] = True
+                # Trigger the release event so keyboard.wait() unblocks
+                try:
+                    keyboard.release("space")
+                except Exception:
+                    pass
+
+        _guard = threading.Thread(target=_timeout_guard, daemon=True)
+        _guard.start()
+
+        try:
+            keyboard.wait("space", suppress=True, trigger_on_release=True)
+        except Exception:
+            pass
 
         audio = self.stop_recording()
         console.print(" " * 60, end="\r")  # clear the recording line
+
+        if _timed_out[0]:
+            console.print(_dim("  (recording capped at 30 s)"))
 
         if audio is None or len(audio) < _AUDIO_SAMPLE_RATE * 0.3:
             # Less than 300 ms of audio — ignore (likely accidental tap)
@@ -977,18 +1070,19 @@ def camera_is_running() -> bool:
 
 def cmd_help(voice_mode: bool = False) -> None:
     lines = [
-        "[bold]/help[/bold]        — show this help",
-        "[bold]/exit[/bold]        — exit the shell (also Ctrl+D)",
-        "[bold]/quit[/bold]        — exit the shell",
-        "[bold]/clear[/bold]       — clear screen and reset display",
-        "[bold]/new[/bold]         — start a fresh conversation (clears context)",
-        "[bold]/history[/bold]     — show last 10 exchanges",
-        "[bold]/session[/bold]     — show session ID and history stats",
-        "[bold]/model[/bold]       — show which model is loaded",
-        "[bold]/voice on[/bold]    — enable voice mode (STT + TTS)",
-        "[bold]/voice off[/bold]   — disable voice mode",
-        "[bold]/camera on[/bold]   — enable camera gesture + lip-VAD input",
-        "[bold]/camera off[/bold]  — disable camera gesture + lip-VAD input",
+        "[bold]/help[/bold]          — show this help",
+        "[bold]/exit[/bold]          — exit the shell (also Ctrl+D)",
+        "[bold]/quit[/bold]          — exit the shell",
+        "[bold]/clear[/bold]         — clear screen and reset display",
+        "[bold]/new[/bold]           — start a fresh conversation (clears context)",
+        "[bold]/history[/bold]       — show last 10 exchanges",
+        "[bold]/session[/bold]       — show session ID and history stats",
+        "[bold]/model[/bold]         — show which model is loaded",
+        "[bold]/voice on[/bold]      — enable voice mode (STT + TTS)",
+        "[bold]/voice off[/bold]     — disable voice mode",
+        "[bold]/voice check[/bold]   — check voice subsystem (mic, STT, TTS)",
+        "[bold]/camera on[/bold]     — enable camera gesture + lip-VAD input",
+        "[bold]/camera off[/bold]    — disable camera gesture + lip-VAD input",
     ]
     console.print(
         Panel(
@@ -998,6 +1092,78 @@ def cmd_help(voice_mode: bool = False) -> None:
             box=box.ROUNDED,
         )
     )
+
+
+def cmd_voice_check() -> None:
+    """
+    Run a voice subsystem health check and print a formatted report.
+    Checks faster-whisper, pyttsx3, sounddevice, audio inputs, and TTS.
+    """
+    console.print()
+    console.print("[bold]Voice subsystem check:[/bold]")
+
+    # ── faster-whisper ────────────────────────────────────────────────────────
+    try:
+        import faster_whisper  # noqa: F401
+        fw_status = "[green]OK[/green]    installed"
+    except ImportError:
+        fw_status = "[red]MISSING[/red]  run: pip install faster-whisper"
+    console.print(f"  faster-whisper : {fw_status}")
+
+    # ── pyttsx3 ───────────────────────────────────────────────────────────────
+    try:
+        import pyttsx3 as _p3  # noqa: F401
+        p3_status = "[green]OK[/green]    installed"
+    except ImportError:
+        p3_status = "[red]MISSING[/red]  run: pip install pyttsx3"
+    console.print(f"  pyttsx3        : {p3_status}")
+
+    # ── sounddevice ───────────────────────────────────────────────────────────
+    try:
+        import sounddevice as _sd_chk  # noqa: F401
+        sd_status = "[green]OK[/green]    installed"
+    except ImportError:
+        sd_status = "[red]MISSING[/red]  run: pip install sounddevice"
+    console.print(f"  sounddevice    : {sd_status}")
+
+    # ── microphone ────────────────────────────────────────────────────────────
+    mic_label = "(sounddevice not installed)"
+    if _SD_OK:
+        try:
+            import sounddevice as sd
+            devices = sd.query_devices()
+            inputs = [
+                d for d in devices
+                if d.get("max_input_channels", 0) > 0
+            ]
+            if inputs:
+                # Try to find the default input
+                try:
+                    default_idx = sd.default.device[0]
+                    default_dev = devices[default_idx]
+                    mic_label = f"{default_dev['name']} (default)"
+                except Exception:
+                    mic_label = inputs[0]["name"]
+            else:
+                mic_label = "[red]MISSING[/red]  no input devices found"
+        except Exception as exc:
+            mic_label = f"[red]ERROR[/red]   {exc}"
+    console.print(f"  microphone     : {mic_label}")
+
+    # ── TTS ───────────────────────────────────────────────────────────────────
+    tts_status = "(pyttsx3 not installed)"
+    if _PYTTSX3_OK:
+        try:
+            import pyttsx3
+            _engine = pyttsx3.init()
+            _engine.setProperty("rate", 175)
+            _engine.say("Voice check OK")
+            _engine.runAndWait()
+            tts_status = "[green]OK[/green]    speaking test"
+        except Exception as exc:
+            tts_status = f"[red]ERROR[/red]   {exc}"
+    console.print(f"  TTS            : {tts_status}")
+    console.print()
 
 
 def cmd_history() -> None:
@@ -1082,6 +1248,9 @@ def handle_special(
         return True
 
     if verb == "/voice":
+        if rest == "check":
+            cmd_voice_check()
+            return True
         if voice_state is None:
             console.print(_dim("/voice requires an active shell session."))
             return True
@@ -1104,7 +1273,8 @@ def handle_special(
             status = "on" if voice_state.get("enabled") else "off"
             console.print(
                 f"Voice mode is currently [bold]{status}[/bold]. "
-                "Use [bold]/voice on[/bold] or [bold]/voice off[/bold]."
+                "Use [bold]/voice on[/bold], [bold]/voice off[/bold], "
+                "or [bold]/voice check[/bold]."
             )
         return True
 
@@ -1563,6 +1733,9 @@ def main() -> None:
     console.print()
 
     if start_voice:
+        # Pre-download / warm-up the Whisper model BEFORE entering the REPL
+        # so the first push-to-talk isn't blocked by a 150 MB download.
+        ensure_whisper_model()
         console.print(
             "[dim]Voice mode active. Hold Space to speak, or just type and press Enter.[/dim]"
         )
