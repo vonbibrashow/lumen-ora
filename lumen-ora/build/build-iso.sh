@@ -168,6 +168,11 @@ else
     ok "Extracted with 7z"
 fi
 
+# osirrox preserves the original ISO's read-only permissions; we need to
+# patch grub.cfg and inject files, so make the whole tree writable for owner.
+chmod -R u+w "$EXTRACT_DIR" 2>/dev/null
+ok "Extract tree made writable"
+
 # Show what we got
 echo "Extracted boot layout:"
 find "$EXTRACT_DIR/boot" -maxdepth 4 -name "*.img" -o -name "*.efi" 2>/dev/null | head -20 || true
@@ -189,7 +194,20 @@ for path in \
         break
     fi
 done
-[ -z "$BOOT_HYBRID" ] && warn "boot_hybrid.img not found — BIOS boot may not work"
+
+# Ubuntu 24.04.4 no longer ships boot_hybrid.img as a file — the hybrid MBR
+# code is baked into the first 432 bytes of the ISO image itself. Extract it.
+if [ -z "$BOOT_HYBRID" ]; then
+    BOOT_HYBRID="$WORK_DIR/boot_hybrid.img"
+    dd if="$SCRIPT_DIR/$UBUNTU_ISO" of="$BOOT_HYBRID" bs=1 count=432 \
+       status=none 2>/dev/null
+    if [ -s "$BOOT_HYBRID" ]; then
+        ok "MBR hybrid: extracted from source ISO (first 432 bytes)"
+    else
+        warn "Could not extract MBR — BIOS boot may not work"
+        BOOT_HYBRID=""
+    fi
+fi
 
 # BIOS eltorito boot image
 ELTORITO=""
@@ -211,18 +229,52 @@ BOOT_CAT_REL="boot/grub/i386-pc/boot.cat"
 [ -f "$EXTRACT_DIR/$BOOT_CAT_REL" ] || BOOT_CAT_REL="boot/grub/boot.cat"
 ok "Boot catalog: $BOOT_CAT_REL"
 
-# EFI image — Ubuntu 24.04 uses boot/grub/efi.img
+# EFI partition image. Older Ubuntu versions shipped a separate efi.img;
+# 24.04.4 embeds the EFI System Partition (ESP) as an appended partition
+# at the end of the ISO. Try to find efi.img first, then fall back to
+# extracting partition #2 from the source ISO.
 EFI_IMG_PATH=""
-for path in \
-    "$EXTRACT_DIR/boot/grub/efi.img" \
-    "$EXTRACT_DIR/EFI/boot/bootx64.efi"; do
-    if [ -f "$path" ]; then
-        EFI_IMG_PATH="$path"
-        EFI_IMG_REL="${path#$EXTRACT_DIR/}"
-        ok "EFI image: $EFI_IMG_REL"
-        break
+if [ -f "$EXTRACT_DIR/boot/grub/efi.img" ]; then
+    EFI_IMG_PATH="$EXTRACT_DIR/boot/grub/efi.img"
+    ok "EFI image: boot/grub/efi.img"
+fi
+
+if [ -z "$EFI_IMG_PATH" ]; then
+    # Parse the source ISO's GPT to find the EFI partition (type 0xef)
+    # and dd it out as a standalone image.
+    echo "  Extracting EFI partition from source ISO..."
+
+    # Use fdisk -l (preferred) or sfdisk to read the partition table
+    PART_INFO=$(fdisk -l "$SCRIPT_DIR/$UBUNTU_ISO" 2>/dev/null \
+        | grep -E "EFI|esp|0xef|EF00" | head -1)
+
+    if [ -z "$PART_INFO" ]; then
+        # Try sfdisk dump as a backup
+        PART_INFO=$(sfdisk -d "$SCRIPT_DIR/$UBUNTU_ISO" 2>/dev/null \
+            | grep -i "type=.*ef" | head -1)
     fi
-done
+
+    if [ -n "$PART_INFO" ]; then
+        # fdisk output format: "device start end sectors size type"
+        # extract start sector and sector count
+        PART_START=$(echo "$PART_INFO" | awk '{print $2}' | grep -oE '[0-9]+' | head -1)
+        PART_SECTORS=$(echo "$PART_INFO" | awk '{print $4}' | grep -oE '[0-9]+' | head -1)
+
+        if [ -n "$PART_START" ] && [ -n "$PART_SECTORS" ]; then
+            EFI_IMG_PATH="$WORK_DIR/efi.img"
+            dd if="$SCRIPT_DIR/$UBUNTU_ISO" of="$EFI_IMG_PATH" \
+                bs=512 skip="$PART_START" count="$PART_SECTORS" \
+                status=none 2>/dev/null
+            if [ -s "$EFI_IMG_PATH" ]; then
+                ok "EFI partition extracted: $(du -h "$EFI_IMG_PATH" | cut -f1) (start=$PART_START sectors=$PART_SECTORS)"
+            else
+                warn "EFI extraction produced empty file"
+                EFI_IMG_PATH=""
+            fi
+        fi
+    fi
+fi
+
 [ -z "$EFI_IMG_PATH" ] && warn "No EFI image found — UEFI boot may not work"
 
 # Detect casper kernel + initrd
