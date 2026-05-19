@@ -401,18 +401,26 @@ if [ "$SIZE_BYTES" -lt 600000000 ]; then
 fi
 ok "ISO size: $SIZE_HUMAN"
 
-# Verify nocloud injection
-if 7z l "$OUTPUT_PATH" 2>/dev/null | grep -q "nocloud"; then
-    ok "nocloud/ directory present in ISO"
-else
-    warn "nocloud/ not detected in ISO listing (may still be present)"
-fi
+# Verify injected files are present. 7z's table output wraps long lines,
+# so use a permissive pattern and check a single column.
+ISO_LISTING=$(7z l "$OUTPUT_PATH" 2>/dev/null)
 
-if 7z l "$OUTPUT_PATH" 2>/dev/null | grep -q "lumen-services"; then
-    ok "lumen-services/ directory present in ISO"
-else
-    warn "lumen-services/ not detected in ISO listing"
-fi
+verify_present() {
+    local label="$1" pattern="$2"
+    if echo "$ISO_LISTING" | grep -qE "$pattern"; then
+        ok "$label present in ISO"
+    else
+        warn "$label NOT detected in ISO listing — install may fail"
+    fi
+}
+
+verify_present "nocloud/user-data"               "nocloud[/\\\\]user-data"
+verify_present "nocloud/meta-data"               "nocloud[/\\\\]meta-data"
+verify_present "lumen-services/lumen-bridge"     "lumen-services[/\\\\]lumen-bridge"
+verify_present "lumen-services/lumen-llama"      "lumen-services[/\\\\]lumen-llama"
+verify_present "lumen-services/lumen-policy"     "lumen-services[/\\\\]lumen-policy"
+verify_present "lumen-services/lumen-firstboot"  "lumen-services[/\\\\]lumen-firstboot"
+verify_present "firstboot.sh"                    "(^|[/\\\\ ])firstboot\\.sh"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Cleanup
