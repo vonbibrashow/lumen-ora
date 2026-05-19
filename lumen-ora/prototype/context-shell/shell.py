@@ -16,9 +16,12 @@ import argparse
 import json
 import os
 import queue
+import socket
+import subprocess
 import sys
 import textwrap
 import threading
+import time
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -178,6 +181,85 @@ def _dim(s: str) -> str:
 
 def _yellow(s: str) -> str:
     return f"[bold yellow]{s}[/bold yellow]"
+
+# ---------------------------------------------------------------------------
+# Policy engine auto-start
+# ---------------------------------------------------------------------------
+
+# Holds the Popen handle if we started the policy engine ourselves; None otherwise.
+_policy_proc: subprocess.Popen | None = None
+
+
+def _win_path_to_wsl(win_path: Path) -> str:
+    """
+    Convert a Windows absolute path to its /mnt/... WSL2 equivalent.
+    Handles both 'C:/...' and '/c/...' (Git Bash) formats.
+    """
+    posix = win_path.as_posix().replace("\\", "/")
+    if len(posix) >= 2 and posix[1] == ":":
+        # Windows: C:/Users/... → /mnt/c/Users/...
+        return f"/mnt/{posix[0].lower()}/{posix[3:]}"
+    if len(posix) >= 3 and posix[0] == "/" and posix[2] == "/":
+        # Git Bash: /c/Users/... → /mnt/c/Users/...
+        return f"/mnt/{posix[1].lower()}/{posix[3:]}"
+    return posix
+
+
+def ensure_policy_engine() -> bool:
+    """
+    Ensure the policy engine is listening on TCP 127.0.0.1:8766.
+
+    1. If already running, return True immediately.
+    2. If not, locate the binary (env var LUMEN_POLICY_BIN or default build path).
+    3. Start it via WSL2 and wait up to 5 s for port 8766 to open.
+    4. Returns True if up, False if unavailable (prints a dim warning, does NOT crash).
+    """
+    global _policy_proc
+
+    # --- Check if already up ---
+    if socket.connect_ex(("127.0.0.1", 8766)) == 0:
+        return True
+
+    # --- Locate binary ---
+    wsl_binary: str | None = None
+
+    env_bin = os.environ.get("LUMEN_POLICY_BIN", "").strip()
+    if env_bin:
+        wsl_binary = env_bin
+    else:
+        # Default: <repo>/policy-engine/target/debug/policy-engine (WSL path)
+        default_win = Path(__file__).parent.parent / "policy-engine" / "target" / "debug" / "policy-engine"
+        wsl_binary = _win_path_to_wsl(default_win)
+
+    # --- Start it ---
+    try:
+        _policy_proc = subprocess.Popen(
+            [
+                "wsl", "-d", "Ubuntu-22.04", "--",
+                "env", "LUMEN_TCP_PORT=8766",
+                wsl_binary,
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except FileNotFoundError:
+        # wsl not found on this machine
+        console.print(_dim("  [policy] wsl not found — policy engine unavailable."))
+        return False
+    except Exception as exc:
+        console.print(_dim(f"  [policy] Failed to start policy engine: {exc}"))
+        return False
+
+    # --- Wait up to 5 s ---
+    for _ in range(10):
+        time.sleep(0.5)
+        if socket.connect_ex(("127.0.0.1", 8766)) == 0:
+            return True
+
+    # Did not come up in time
+    console.print(_dim("  [policy] Policy engine did not bind within 5 s — running without enforcement."))
+    return False
+
 
 # ---------------------------------------------------------------------------
 # Lumen directory setup
@@ -1469,6 +1551,17 @@ def main() -> None:
 
     print_banner(bridge_ok, policy_ok, voice_mode=start_voice, camera_mode=start_cam)
 
+    # --- Policy engine auto-start (only if not already running) ---
+    if policy_ok:
+        console.print("  Policy engine: already running")
+    else:
+        engine_up = ensure_policy_engine()
+        if engine_up:
+            console.print("  Policy engine: started")
+        else:
+            console.print(_dim("  Policy engine: unavailable (running without enforcement)"))
+    console.print()
+
     if start_voice:
         console.print(
             "[dim]Voice mode active. Hold Space to speak, or just type and press Enter.[/dim]"
@@ -1491,6 +1584,11 @@ def main() -> None:
         console.print("[dim]Goodbye.[/dim]")
     finally:
         stop_camera()
+        if _policy_proc is not None:
+            try:
+                _policy_proc.terminate()
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":
