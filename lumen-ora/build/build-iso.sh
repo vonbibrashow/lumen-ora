@@ -24,8 +24,9 @@ set -euo pipefail
 
 VERSION="v0.4.0-beta"
 OUTPUT_ISO="lumen-ora-${VERSION}-installer.iso"
-UBUNTU_VERSION="24.04.2"
-UBUNTU_ISO_URL="https://releases.ubuntu.com/24.04/ubuntu-${UBUNTU_VERSION}-live-server-amd64.iso"
+# UBUNTU_VERSION is auto-detected at runtime from the releases page —
+# point releases come out every ~6 months (24.04.1, .2, .3, .4 ...) so
+# hard-coding the version causes 404s on stale scripts.
 UBUNTU_ISO="ubuntu-24.04-live-server-amd64.iso"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -88,7 +89,32 @@ if [ -f "$UBUNTU_ISO" ]; then
 fi
 
 if [ ! -f "$UBUNTU_ISO" ]; then
-    echo "Downloading Ubuntu Server 24.04.2 (~700 MB)..."
+    # Auto-detect latest 24.04.x point release.
+    # Ubuntu publishes point releases at https://releases.ubuntu.com/24.04/
+    # and removes older ones, so we scrape the directory listing.
+    echo "Detecting latest Ubuntu Server 24.04 point release..."
+    LATEST_FILENAME=$(curl -s https://releases.ubuntu.com/24.04/ \
+        | grep -oE 'ubuntu-24\.04\.[0-9]+-live-server-amd64\.iso' \
+        | sort -V | tail -1)
+
+    if [ -z "$LATEST_FILENAME" ]; then
+        # Fallback: try known versions in reverse order
+        for v in 24.04.4 24.04.3 24.04.2 24.04.1 24.04; do
+            candidate_url="https://releases.ubuntu.com/24.04/ubuntu-${v}-live-server-amd64.iso"
+            if curl -fIs "$candidate_url" >/dev/null 2>&1; then
+                LATEST_FILENAME="ubuntu-${v}-live-server-amd64.iso"
+                ok "Fallback to $LATEST_FILENAME"
+                break
+            fi
+        done
+    fi
+
+    [ -z "$LATEST_FILENAME" ] && fail "Could not find any Ubuntu 24.04 server ISO on releases.ubuntu.com"
+
+    UBUNTU_ISO_URL="https://releases.ubuntu.com/24.04/$LATEST_FILENAME"
+    ok "Latest: $LATEST_FILENAME"
+
+    echo "Downloading $LATEST_FILENAME (~700 MB)..."
     wget --progress=bar:force:noscroll \
          --retry-connrefused \
          --tries=3 \
