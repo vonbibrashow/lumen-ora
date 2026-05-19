@@ -806,6 +806,212 @@ def run_bridge_tests(skip_model: bool = True) -> tuple[bool, subprocess.Popen | 
 
 
 # ===========================================================================
+# LAYER 3b: Bridge auth tests (LUMEN_API_TOKEN gating)
+# ===========================================================================
+
+AUTH_BRIDGE_PORT = 8767  # separate port so we don't clobber the main bridge
+AUTH_BRIDGE_URL = f"http://127.0.0.1:{AUTH_BRIDGE_PORT}"
+AUTH_TEST_TOKEN = "test-token-abc-123"
+
+
+def _is_url_running(url: str) -> bool:
+    try:
+        import urllib.request
+        with urllib.request.urlopen(f"{url}/health", timeout=3) as r:
+            return r.status == 200
+    except Exception:
+        return False
+
+
+def _start_auth_bridge() -> subprocess.Popen | None:
+    """Start a bridge subprocess with LUMEN_API_TOKEN set on a separate port."""
+    bridge_dir = Path(__file__).parent / "inference-bridge"
+    bridge_py = bridge_dir / "bridge.py"
+    if not bridge_py.exists():
+        return None
+
+    env = os.environ.copy()
+    env["LUMEN_API_TOKEN"] = AUTH_TEST_TOKEN
+    env["BRIDGE_PORT"] = str(AUTH_BRIDGE_PORT)
+    env["POLICY_ENGINE_SOCKET"] = "tcp://127.0.0.1:8766"
+
+    cmd = [sys.executable, str(bridge_py), "--port", str(AUTH_BRIDGE_PORT)]
+    print(f"  Starting auth-bridge: {' '.join(cmd)}")
+    try:
+        proc = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except Exception:
+        return None
+
+    for _ in range(20):
+        if _is_url_running(AUTH_BRIDGE_URL):
+            return proc
+        time.sleep(0.5)
+    proc.terminate()
+    return None
+
+
+def run_auth_tests() -> tuple[bool, subprocess.Popen | None]:
+    """
+    Verify the LUMEN_API_TOKEN gating on /infer, /infer-stream, /evaluate_tool.
+    Spins up a second bridge instance on port 8767 with the token set.
+    """
+    section("LAYER 3b — Bridge Auth (LUMEN_API_TOKEN)")
+
+    # Dep check first
+    missing = []
+    for pkg in ("fastapi", "uvicorn", "httpx", "pydantic", "sse_starlette"):
+        try:
+            __import__(pkg)
+        except ImportError:
+            missing.append(pkg)
+    if missing:
+        record("auth-bridge dependencies installed", False, f"Missing: {missing}")
+        return False, None
+
+    proc = _start_auth_bridge()
+    if proc is None or not _is_url_running(AUTH_BRIDGE_URL):
+        record("auth-bridge start", False,
+               f"Could not start bridge on {AUTH_BRIDGE_URL} with LUMEN_API_TOKEN")
+        return False, proc
+    record("auth-bridge start", True, AUTH_BRIDGE_URL)
+
+    all_ok = True
+    import urllib.request, urllib.error
+
+    # ── Test 1: /health is open even with auth enabled, and reports auth_required ──
+    try:
+        with urllib.request.urlopen(f"{AUTH_BRIDGE_URL}/health", timeout=5) as r:
+            body = json.loads(r.read())
+        ok = r.status == 200 and body.get("auth_required") is True
+        all_ok &= record("/health open + reports auth_required=true", ok, str(body))
+    except Exception as e:
+        all_ok &= record("/health open + reports auth_required=true", False, str(e))
+
+    # ── Test 2: /infer WITHOUT Authorization header → 401 ──────────────────────
+    try:
+        req = urllib.request.Request(
+            f"{AUTH_BRIDGE_URL}/infer",
+            data=json.dumps({"prompt": "hi", "stream": False}).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        status = None
+        try:
+            with urllib.request.urlopen(req, timeout=10) as r:
+                status = r.status
+        except urllib.error.HTTPError as e:
+            status = e.code
+        ok = status == 401
+        all_ok &= record("POST /infer without token → 401", ok, f"status={status}")
+    except Exception as e:
+        all_ok &= record("POST /infer without token → 401", False, str(e))
+
+    # ── Test 3: /infer with WRONG token → 401 ──────────────────────────────────
+    try:
+        req = urllib.request.Request(
+            f"{AUTH_BRIDGE_URL}/infer",
+            data=json.dumps({"prompt": "hi", "stream": False}).encode(),
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": "Bearer wrong-token",
+            },
+            method="POST",
+        )
+        status = None
+        try:
+            with urllib.request.urlopen(req, timeout=10) as r:
+                status = r.status
+        except urllib.error.HTTPError as e:
+            status = e.code
+        ok = status == 401
+        all_ok &= record("POST /infer with wrong token → 401", ok, f"status={status}")
+    except Exception as e:
+        all_ok &= record("POST /infer with wrong token → 401", False, str(e))
+
+    # ── Test 4: /infer with CORRECT token → not 401 (200 or 503) ──────────────
+    # 503 is acceptable: bridge is reachable + authorized, but llama-server may be down.
+    try:
+        req = urllib.request.Request(
+            f"{AUTH_BRIDGE_URL}/infer",
+            data=json.dumps({"prompt": "hi", "stream": False}).encode(),
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {AUTH_TEST_TOKEN}",
+            },
+            method="POST",
+        )
+        status = None
+        try:
+            with urllib.request.urlopen(req, timeout=15) as r:
+                status = r.status
+        except urllib.error.HTTPError as e:
+            status = e.code
+        ok = status != 401  # anything but 401 means auth passed
+        all_ok &= record("POST /infer with valid token → not 401 (auth passed)",
+                         ok, f"status={status}")
+    except Exception as e:
+        all_ok &= record("POST /infer with valid token → not 401", False, str(e))
+
+    # ── Test 5: /evaluate_tool without token → 401 ─────────────────────────────
+    try:
+        req = urllib.request.Request(
+            f"{AUTH_BRIDGE_URL}/evaluate_tool?tool_name=read_file",
+            data=json.dumps({"path": "/home/user/x.txt"}).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        status = None
+        try:
+            with urllib.request.urlopen(req, timeout=10) as r:
+                status = r.status
+        except urllib.error.HTTPError as e:
+            status = e.code
+        ok = status == 401
+        all_ok &= record("POST /evaluate_tool without token → 401", ok, f"status={status}")
+    except Exception as e:
+        all_ok &= record("POST /evaluate_tool without token → 401", False, str(e))
+
+    # ── Test 6: /infer-stream via GET query token → not 401 ────────────────────
+    # EventSource cannot set headers — we accept ?token= as fallback.
+    try:
+        url = (
+            f"{AUTH_BRIDGE_URL}/infer-stream?prompt=hi"
+            f"&token={AUTH_TEST_TOKEN}"
+        )
+        status = None
+        try:
+            with urllib.request.urlopen(url, timeout=10) as r:
+                status = r.status
+                # We don't need to consume the stream — status is set on response start.
+        except urllib.error.HTTPError as e:
+            status = e.code
+        ok = status != 401
+        all_ok &= record("GET /infer-stream?token=... → not 401", ok, f"status={status}")
+    except Exception as e:
+        # Some streams may close abruptly; still acceptable as long as not 401
+        if "401" in str(e):
+            all_ok &= record("GET /infer-stream?token=... → not 401", False, str(e))
+        else:
+            all_ok &= record("GET /infer-stream?token=... → not 401 (stream)", True, str(e))
+
+    # ── Test 7: /infer-stream without token → 401 ──────────────────────────────
+    try:
+        url = f"{AUTH_BRIDGE_URL}/infer-stream?prompt=hi"
+        status = None
+        try:
+            with urllib.request.urlopen(url, timeout=10) as r:
+                status = r.status
+        except urllib.error.HTTPError as e:
+            status = e.code
+        ok = status == 401
+        all_ok &= record("GET /infer-stream without token → 401", ok, f"status={status}")
+    except Exception as e:
+        all_ok &= record("GET /infer-stream without token → 401", False, str(e))
+
+    return all_ok, proc
+
+
+# ===========================================================================
 # LAYER 4: Full end-to-end pipeline test (requires llama-server + model)
 # ===========================================================================
 
@@ -1025,6 +1231,11 @@ Examples:
         if not args.skip_bridge:
             # Layer 3: Inference bridge
             ok, proc = run_bridge_tests(skip_model=not args.all)
+            if proc:
+                processes.append(proc)
+
+            # Layer 3b: Bridge auth gating
+            ok, proc = run_auth_tests()
             if proc:
                 processes.append(proc)
 

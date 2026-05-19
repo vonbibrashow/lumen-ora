@@ -26,10 +26,11 @@ from typing import Any, AsyncIterator
 import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from sse_starlette.sse import EventSourceResponse
+from starlette.middleware.base import BaseHTTPMiddleware
 
 from tool_schema import TOOL_SCHEMAS, dispatch_tool
 
@@ -58,6 +59,16 @@ POLICY_SOCKET_PATH = os.environ.get("POLICY_ENGINE_SOCKET", "tcp://127.0.0.1:876
 BRIDGE_HOST = os.environ.get("BRIDGE_HOST", "127.0.0.1")
 BRIDGE_PORT = int(os.environ.get("BRIDGE_PORT", "8765"))
 
+# Optional API token auth. If LUMEN_API_TOKEN is set, all protected endpoints
+# (/infer, /infer-stream, /evaluate_tool) require Authorization: Bearer <token>.
+# If unset, no auth is enforced (back-compat with single-user local mode).
+LUMEN_API_TOKEN = os.environ.get("LUMEN_API_TOKEN", "").strip()
+
+# Endpoints that require auth when LUMEN_API_TOKEN is set.
+# /health, /tools, /session-info, / (dashboard), /static remain open so
+# clients can detect that auth is required without needing the token first.
+_PROTECTED_PATHS = ("/infer", "/infer-stream", "/evaluate_tool")
+
 # ---------------------------------------------------------------------------
 # FastAPI app
 # ---------------------------------------------------------------------------
@@ -74,6 +85,44 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+class BearerAuthMiddleware(BaseHTTPMiddleware):
+    """
+    If LUMEN_API_TOKEN is set, require `Authorization: Bearer <token>` on
+    protected endpoints. The token can also be passed as `?token=<token>`
+    in the query string (for EventSource clients that cannot set headers).
+    Unprotected paths (/health, /tools, /session-info, /, /static) always
+    pass through so clients can detect the auth requirement.
+    """
+
+    async def dispatch(self, request: Request, call_next):
+        if not LUMEN_API_TOKEN:
+            return await call_next(request)
+
+        path = request.url.path
+        # Only guard the protected endpoints
+        if not any(path == p or path.startswith(p + "/") for p in _PROTECTED_PATHS):
+            return await call_next(request)
+
+        # Accept Bearer header OR ?token=... query param (for EventSource)
+        auth_header = request.headers.get("authorization", "")
+        provided = ""
+        if auth_header.lower().startswith("bearer "):
+            provided = auth_header[7:].strip()
+        if not provided:
+            provided = request.query_params.get("token", "").strip()
+
+        if provided != LUMEN_API_TOKEN:
+            return JSONResponse(
+                status_code=401,
+                content={"detail": "Missing or invalid Authorization Bearer token"},
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        return await call_next(request)
+
+
+app.add_middleware(BearerAuthMiddleware)
 
 # ---------------------------------------------------------------------------
 # Request / Response models
@@ -599,6 +648,7 @@ async def health():
         "version": "0.1.0",
         "smart_model": is_llama_running(),
         "fast_model": is_fast_model_running(),
+        "auth_required": bool(LUMEN_API_TOKEN),
     }
 
 
@@ -660,6 +710,7 @@ async def session_info():
         "smart_model": is_llama_running(),
         "fast_model": is_fast_model_running(),
         "tool_count": len(TOOL_SCHEMAS),
+        "auth_required": bool(LUMEN_API_TOKEN),
     }
 
 

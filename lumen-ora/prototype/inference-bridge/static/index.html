@@ -172,6 +172,33 @@ let currentSSE = null;
 let isStreaming = false;
 
 // ---------------------------------------------------------------------------
+// Auth — token persisted in localStorage. Prompted for on first 401.
+// ---------------------------------------------------------------------------
+let apiToken = localStorage.getItem('lumen_api_token') || '';
+
+function authHeaders() {
+  return apiToken ? { 'Authorization': 'Bearer ' + apiToken } : {};
+}
+
+function promptForToken(reason) {
+  const msg = reason
+    ? reason + '\n\nEnter your LUMEN_API_TOKEN:'
+    : 'Enter your LUMEN_API_TOKEN:';
+  const t = window.prompt(msg, '');
+  if (t && t.trim()) {
+    apiToken = t.trim();
+    localStorage.setItem('lumen_api_token', apiToken);
+    return true;
+  }
+  return false;
+}
+
+function clearToken() {
+  apiToken = '';
+  localStorage.removeItem('lumen_api_token');
+}
+
+// ---------------------------------------------------------------------------
 // Model tier toggle
 // ---------------------------------------------------------------------------
 function setTier(tier) {
@@ -197,6 +224,12 @@ async function fetchSessionInfo() {
     document.getElementById('stat-smart').textContent  = data.smart_model ? 'online' : 'offline';
     document.getElementById('stat-fast').textContent   = data.fast_model  ? 'online' : 'offline';
     document.getElementById('conn-dot').classList.add('connected');
+
+    // If the bridge requires auth but we don't have a token yet, prompt now
+    // so the user isn't surprised on first send.
+    if (data.auth_required && !apiToken) {
+      promptForToken('This Lumen Ora bridge requires an API token.');
+    }
   } catch {
     document.getElementById('conn-dot').classList.remove('connected');
   }
@@ -401,8 +434,20 @@ function sendMessage() {
   // Close any existing SSE
   if (currentSSE) { currentSSE.close(); currentSSE = null; }
 
-  const url = '/infer-stream?prompt=' + encodeURIComponent(prompt) + '&model_tier=' + currentTier;
+  let url = '/infer-stream?prompt=' + encodeURIComponent(prompt) + '&model_tier=' + currentTier;
+  if (apiToken) {
+    url += '&token=' + encodeURIComponent(apiToken);
+  }
   const sse = new EventSource(url);
+  sse.addEventListener('error', () => {
+    // EventSource doesn't surface HTTP status, but a 401 closes the connection
+    // immediately. If we have no token, the most likely cause is missing auth.
+    if (!apiToken && sse.readyState === EventSource.CLOSED) {
+      if (promptForToken('Authentication required. Enter LUMEN_API_TOKEN to continue.')) {
+        // Token captured — user can resend their last message
+      }
+    }
+  });
   currentSSE = sse;
 
   // Track pending tool calls for card attachment

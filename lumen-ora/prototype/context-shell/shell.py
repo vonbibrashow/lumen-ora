@@ -144,6 +144,18 @@ BRIDGE_URL = os.environ.get("LUMEN_BRIDGE_URL", "http://127.0.0.1:8765")
 POLICY_HOST = os.environ.get("LUMEN_POLICY_HOST", "127.0.0.1")
 POLICY_PORT = int(os.environ.get("LUMEN_POLICY_PORT", "8766"))
 
+# Optional API token for remote/multi-user deployments. When set, the bridge
+# enforces Authorization: Bearer <token> on protected endpoints. Local-only
+# users can leave this unset.
+LUMEN_API_TOKEN = os.environ.get("LUMEN_API_TOKEN", "").strip()
+
+
+def _auth_headers() -> dict[str, str]:
+    """Return Authorization header dict if a token is configured, else {}."""
+    if LUMEN_API_TOKEN:
+        return {"Authorization": f"Bearer {LUMEN_API_TOKEN}"}
+    return {}
+
 LUMEN_DIR = Path.home() / ".lumen"
 SESSION_FILE = LUMEN_DIR / "session_id"
 HISTORY_FILE = LUMEN_DIR / "history.jsonl"
@@ -452,10 +464,14 @@ def build_memory_context(facts: list[dict]) -> str:
 def check_bridge() -> tuple[bool, str]:
     """Return (ok, detail)."""
     try:
-        r = httpx.get(f"{BRIDGE_URL}/health", timeout=4.0)
+        r = httpx.get(f"{BRIDGE_URL}/health", timeout=4.0, headers=_auth_headers())
         if r.status_code == 200:
             data = r.json()
+            if data.get("auth_required") and not LUMEN_API_TOKEN:
+                return False, "auth required — set LUMEN_API_TOKEN"
             return True, data.get("version", "ok")
+        if r.status_code == 401:
+            return False, "auth required — set LUMEN_API_TOKEN"
         return False, f"HTTP {r.status_code}"
     except httpx.ConnectError:
         return False, "connection refused"
@@ -549,7 +565,12 @@ def call_bridge(prompt: str, session_id: str, messages: list[dict] | None = None
             f"{BRIDGE_URL}/infer",
             json=payload,
             timeout=TIMEOUT_SECONDS,
+            headers=_auth_headers(),
         )
+        if r.status_code == 401:
+            raise PermissionError(
+                "Bridge requires authentication. Set LUMEN_API_TOKEN to the bridge's token."
+            )
         r.raise_for_status()
         return r.json()
     except httpx.TimeoutException as exc:
@@ -1764,6 +1785,9 @@ def repl(session_id: str, start_voice: bool = False, start_cam_input: bool = Fal
             )
             continue
         except TimeoutError as exc:
+            console.print(_red(f"\n{exc}\n"))
+            continue
+        except PermissionError as exc:
             console.print(_red(f"\n{exc}\n"))
             continue
         except httpx.HTTPStatusError as exc:
