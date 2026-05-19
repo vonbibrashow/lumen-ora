@@ -1,0 +1,32 @@
+[Unit]
+Description=Lumen Ora — inference bridge + web dashboard (:8765)
+Documentation=https://github.com/vonbibrashow/lumen-ora
+After=lumen-llama.service lumen-policy.service network.target
+Wants=lumen-llama.service lumen-policy.service
+# Bridge won't work without the model; enforce ordering
+Requires=lumen-llama.service
+
+[Service]
+Type=simple
+User=lumen
+Group=lumen
+WorkingDirectory=/opt/lumen-ora/prototype/inference-bridge
+
+ExecStart=python3.11 /opt/lumen-ora/prototype/inference-bridge/bridge.py
+
+# Environment — set LUMEN_API_TOKEN in /etc/lumen/env or override here
+EnvironmentFile=-/etc/lumen/env
+Environment=LUMEN_BIND_HOST=0.0.0.0
+Environment=LLAMA_SERVER_URL=http://127.0.0.1:8080
+Environment=POLICY_ENGINE_ADDR=127.0.0.1:8766
+
+Restart=on-failure
+RestartSec=10
+TimeoutStartSec=60
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=lumen-bridge
+
+[Install]
+WantedBy=multi-user.target

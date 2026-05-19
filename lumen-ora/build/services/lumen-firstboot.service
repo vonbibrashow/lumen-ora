@@ -1,0 +1,27 @@
+[Unit]
+Description=Lumen Ora — first-boot setup (runs once)
+Documentation=https://github.com/vonbibrashow/lumen-ora
+After=network-online.target
+Wants=network-online.target
+# Only run if the done-marker file does not exist
+ConditionPathExists=!/home/lumen/.lumen-firstboot-done
+
+[Service]
+Type=oneshot
+User=lumen
+Group=lumen
+ExecStart=/home/lumen/firstboot.sh
+
+# Allow a long time — model download can take 20+ minutes
+TimeoutStartSec=3600
+
+# Log to the journal AND to /var/log/lumen-firstboot.log
+StandardOutput=journal+console
+StandardError=journal+console
+SyslogIdentifier=lumen-firstboot
+
+# Don't restart — if it fails, the admin should inspect logs and re-run manually
+Restart=no
+
+[Install]
+WantedBy=multi-user.target

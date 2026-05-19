@@ -1,0 +1,171 @@
+#cloud-config
+# Ubuntu Server 24.04 LTS — Lumen Ora unattended autoinstall
+# Reference: https://canonical-subiquity.readthedocs-hosted.com/en/latest/reference/autoinstall-reference.html
+#
+# To customise before building the ISO:
+#   - Change the password hash under identity.password
+#     Generate with: python3 -c "import crypt; print(crypt.crypt('yourpassword', crypt.mksalt(crypt.METHOD_SHA512)))"
+#   - Add your SSH public key under ssh.authorized-keys
+#   - Change the hostname under identity.hostname
+
+autoinstall:
+  version: 1
+
+  # -------------------------------------------------------------------------
+  # Locale + keyboard
+  # -------------------------------------------------------------------------
+  locale: en_US.UTF-8
+  keyboard:
+    layout: us
+
+  # -------------------------------------------------------------------------
+  # Network — DHCP on first available NIC; configure statically post-install
+  # -------------------------------------------------------------------------
+  network:
+    network:
+      version: 2
+      ethernets:
+        any:
+          match:
+            name: "en*"
+          dhcp4: true
+          dhcp6: false
+
+  # -------------------------------------------------------------------------
+  # Storage — wipe the first disk and create a simple layout
+  # Change 'disk: sda' to 'disk: nvme0n1' for NVMe drives
+  # -------------------------------------------------------------------------
+  storage:
+    layout:
+      name: lvm
+      sizing-policy: all
+    config:
+      - type: disk
+        id: disk0
+        match:
+          size: largest      # installs to the largest available disk
+        wipe: superblock
+        preserve: false
+        grub_device: true
+      - type: partition
+        id: efi-partition
+        device: disk0
+        size: 1G
+        flag: boot
+        grub_device: true
+      - type: format
+        id: efi-format
+        volume: efi-partition
+        fstype: fat32
+      - type: partition
+        id: swap-partition
+        device: disk0
+        size: 4G
+      - type: format
+        id: swap-format
+        volume: swap-partition
+        fstype: swap
+      - type: partition
+        id: root-partition
+        device: disk0
+        size: -1             # rest of disk
+      - type: format
+        id: root-format
+        volume: root-partition
+        fstype: ext4
+      - type: mount
+        id: efi-mount
+        device: efi-format
+        path: /boot/efi
+      - type: mount
+        id: swap-mount
+        device: swap-format
+        path: swap
+      - type: mount
+        id: root-mount
+        device: root-format
+        path: /
+
+  # -------------------------------------------------------------------------
+  # User account
+  # Default password: lumenora  (change this!)
+  # Generate hash: python3 -c "import crypt; print(crypt.crypt('lumenora', crypt.mksalt(crypt.METHOD_SHA512)))"
+  # -------------------------------------------------------------------------
+  identity:
+    hostname: lumen-ora
+    username: lumen
+    # Default password: lumenora — CHANGE THIS before deploying
+    password: "$6$rounds=4096$saltsaltsaltsalt$AbCdEfGhIjKlMnOpQrStUvWxYz0123456789AbCdEfGhIjKlMnOpQrStUvWxYz0123456789AbCdEf"
+    realname: Lumen Ora
+
+  # -------------------------------------------------------------------------
+  # SSH — enabled, password auth on (add your key below for key-only auth)
+  # -------------------------------------------------------------------------
+  ssh:
+    install-server: true
+    allow-pw: true
+    # Add your public key here for passwordless login:
+    # authorized-keys:
+    #   - "ssh-ed25519 AAAAC3... user@host"
+
+  # -------------------------------------------------------------------------
+  # Packages installed during setup (apt)
+  # -------------------------------------------------------------------------
+  packages:
+    - python3.11
+    - python3.11-venv
+    - python3-pip
+    - git
+    - curl
+    - wget
+    - build-essential
+    - pkg-config
+    - libssl-dev
+    - libffi-dev
+    - libsndfile1
+    - portaudio19-dev
+    - xclip          # clipboard support for pyperclip on Linux
+    - ufw
+    - htop
+    - tmux
+    - unzip
+
+  # -------------------------------------------------------------------------
+  # Snaps — none (keep it minimal)
+  # -------------------------------------------------------------------------
+  snaps: []
+
+  # -------------------------------------------------------------------------
+  # Late commands — run after package install, before first reboot
+  # -------------------------------------------------------------------------
+  late-commands:
+    # Install Rust toolchain for the lumen user
+    - curtin in-target --target=/target -- bash -c "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | su -c 'sh -s -- -y --no-modify-path' lumen"
+    - curtin in-target --target=/target -- bash -c "echo 'source /home/lumen/.cargo/env' >> /home/lumen/.bashrc"
+
+    # Create lumen data directories
+    - curtin in-target --target=/target -- bash -c "mkdir -p /home/lumen/.lumen/{screenshots,tools} && chown -R lumen:lumen /home/lumen/.lumen"
+    - curtin in-target --target=/target -- bash -c "mkdir -p /opt/lumen-ora && chown lumen:lumen /opt/lumen-ora"
+
+    # Copy systemd service files
+    - cp -r /cdrom/lumen-services /target/etc/systemd/system/lumen-services
+    - curtin in-target --target=/target -- bash -c "cp /etc/systemd/system/lumen-services/*.service /etc/systemd/system/"
+    - curtin in-target --target=/target -- bash -c "systemctl enable lumen-firstboot.service"
+
+    # Copy firstboot script
+    - cp /cdrom/firstboot.sh /target/home/lumen/firstboot.sh
+    - curtin in-target --target=/target -- bash -c "chmod +x /home/lumen/firstboot.sh && chown lumen:lumen /home/lumen/firstboot.sh"
+
+    # Configure firewall — allow SSH + bridge dashboard
+    - curtin in-target --target=/target -- bash -c "ufw allow 22/tcp && ufw allow 8765/tcp && ufw --force enable"
+
+    # Disable needrestart interactive prompts
+    - curtin in-target --target=/target -- bash -c "echo '\$nrconf{restart} = \"a\";' > /etc/needrestart/conf.d/50-lumen.conf"
+
+  # -------------------------------------------------------------------------
+  # Confirm before writing (set to false for fully unattended)
+  # -------------------------------------------------------------------------
+  confirm-toformat: false
+
+  # Reboot immediately after install (no prompt)
+  shutdown: reboot

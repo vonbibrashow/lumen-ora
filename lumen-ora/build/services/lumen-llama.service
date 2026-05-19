@@ -1,0 +1,40 @@
+[Unit]
+Description=Lumen Ora — llama-server (local model inference)
+Documentation=https://github.com/vonbibrashow/lumen-ora
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+User=lumen
+Group=lumen
+WorkingDirectory=/opt/lumen-ora/prototype/inference-bridge
+
+# llama-server binary and model path — firstboot.sh patches these
+ExecStart=/opt/lumen-ora/prototype/inference-bridge/llama-cpp/llama-server \
+    --model /opt/lumen-ora/prototype/inference-bridge/llama-cpp/qwen2.5-7b-instruct-q4_k_m.gguf \
+    --host 127.0.0.1 \
+    --port 8080 \
+    --ctx-size 8192 \
+    --n-predict 2048 \
+    --threads 4 \
+    --chat-template chatml
+
+Restart=on-failure
+RestartSec=10
+TimeoutStartSec=120
+
+# Give llama-server time to load the model before marking as "ready"
+# (the model takes 5-30 s to mmap depending on disk speed)
+ExecStartPost=/bin/sleep 5
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=lumen-llama
+
+# Resource limits — allow large model mmapping
+LimitNOFILE=65536
+LimitMEMLOCK=infinity
+
+[Install]
+WantedBy=multi-user.target
