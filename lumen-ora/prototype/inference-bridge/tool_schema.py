@@ -554,6 +554,47 @@ TOOL_EXECUTORS = {
 }
 
 
+# ---------------------------------------------------------------------------
+# Plugin loader — auto-loads tools from ~/.lumen/tools/*.py
+# ---------------------------------------------------------------------------
+
+def _load_plugins() -> None:
+    """
+    Scan ~/.lumen/tools/ for *.py plugin files.
+    Each must export PLUGIN_TOOLS: list of {name, description, parameters, execute}.
+    Registered tools become available via dispatch_tool and appear in TOOL_SCHEMAS.
+    """
+    plugin_dir = Path.home() / ".lumen" / "tools"
+    if not plugin_dir.exists():
+        return
+
+    import importlib.util
+
+    for plugin_file in sorted(plugin_dir.glob("*.py")):
+        try:
+            spec = importlib.util.spec_from_file_location(plugin_file.stem, plugin_file)
+            module = importlib.util.module_from_spec(spec)  # type: ignore[arg-type]
+            spec.loader.exec_module(module)  # type: ignore[union-attr]
+
+            tools: list[dict[str, Any]] = getattr(module, "PLUGIN_TOOLS", [])
+            for tool in tools:
+                name = tool.get("name", "")
+                execute_fn = tool.get("execute")
+                if not name or not callable(execute_fn):
+                    continue
+                # Register in schema list and executor map
+                schema = {k: v for k, v in tool.items() if k != "execute"}
+                TOOL_SCHEMAS.append(schema)
+                TOOL_EXECUTORS[name] = lambda p, fn=execute_fn: fn(p)
+        except Exception as exc:
+            # Bad plugin — warn but don't crash
+            import logging as _log
+            _log.getLogger("lumen.plugins").warning("Failed to load plugin %s: %s", plugin_file, exc)
+
+
+_load_plugins()
+
+
 def dispatch_tool(tool_name: str, parameters: dict[str, Any]) -> Any:
     """Execute a tool by name. Raises KeyError for unknown tools."""
     executor = TOOL_EXECUTORS[tool_name]

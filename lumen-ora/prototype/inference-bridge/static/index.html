@@ -1,0 +1,504 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Lumen Ora</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --bg:        #0f1117;
+    --surface:   #1a1d27;
+    --surface2:  #242736;
+    --border:    #2e3247;
+    --accent:    #4f7fff;
+    --accent2:   #7c5cfc;
+    --text:      #d4d8f0;
+    --muted:     #6b7094;
+    --green:     #3dd68c;
+    --red:       #f04a4a;
+    --yellow:    #f0b429;
+    --mono:      'Cascadia Code', 'Fira Code', 'Consolas', monospace;
+    --sans:      'Segoe UI', system-ui, sans-serif;
+    --radius:    8px;
+    --sidebar-w: 260px;
+  }
+
+  html, body { height: 100%; background: var(--bg); color: var(--text); font-family: var(--sans); font-size: 14px; }
+
+  /* ── Layout ── */
+  #app { display: grid; grid-template-rows: 48px 1fr 40px; grid-template-columns: 1fr var(--sidebar-w); height: 100vh; overflow: hidden; }
+  #header   { grid-column: 1 / -1; display: flex; align-items: center; gap: 12px; padding: 0 16px; background: var(--surface); border-bottom: 1px solid var(--border); }
+  #chat     { display: flex; flex-direction: column; overflow: hidden; border-right: 1px solid var(--border); }
+  #sidebar  { display: flex; flex-direction: column; overflow: hidden; background: var(--surface); }
+  #statsbar { grid-column: 1 / -1; display: flex; align-items: center; gap: 20px; padding: 0 16px; background: var(--surface); border-top: 1px solid var(--border); font-size: 12px; color: var(--muted); }
+
+  /* ── Header ── */
+  #header h1 { font-size: 15px; font-weight: 600; letter-spacing: .02em; color: #fff; }
+  .tier-badge { font-size: 11px; font-weight: 600; padding: 2px 8px; border-radius: 20px; background: var(--surface2); border: 1px solid var(--border); cursor: pointer; transition: all .15s; }
+  .tier-badge.smart { border-color: var(--accent); color: var(--accent); }
+  .tier-badge.fast  { border-color: var(--accent2); color: var(--accent2); }
+  .tier-badge:hover { opacity: .8; }
+  .conn-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--red); transition: background .3s; }
+  .conn-dot.connected { background: var(--green); }
+  #header-spacer { flex: 1; }
+  #model-toggle { display: flex; gap: 6px; }
+
+  /* ── Chat messages ── */
+  #messages { flex: 1; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 12px; }
+  .msg { max-width: 78%; display: flex; flex-direction: column; gap: 4px; }
+  .msg.user { align-self: flex-end; align-items: flex-end; }
+  .msg.ai   { align-self: flex-start; align-items: flex-start; }
+  .msg-role { font-size: 11px; color: var(--muted); font-weight: 500; }
+  .msg-bubble { padding: 10px 14px; border-radius: var(--radius); line-height: 1.5; white-space: pre-wrap; word-break: break-word; }
+  .msg.user .msg-bubble { background: var(--accent); color: #fff; border-radius: var(--radius) var(--radius) 2px var(--radius); }
+  .msg.ai   .msg-bubble { background: var(--surface2); border: 1px solid var(--border); border-radius: var(--radius) var(--radius) var(--radius) 2px; }
+  .msg-bubble.streaming::after { content: '▍'; animation: blink .7s step-end infinite; margin-left: 2px; }
+  @keyframes blink { 0%,100%{opacity:1} 50%{opacity:0} }
+
+  /* ── Tool call cards ── */
+  .tool-card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); font-family: var(--mono); font-size: 12px; overflow: hidden; max-width: 480px; }
+  .tool-card-header { display: flex; align-items: center; gap: 8px; padding: 7px 10px; cursor: pointer; user-select: none; background: var(--surface2); }
+  .tool-card-header:hover { background: var(--border); }
+  .tool-name { font-weight: 600; color: var(--accent); flex: 1; }
+  .policy-badge { font-size: 10px; font-weight: 700; padding: 2px 7px; border-radius: 20px; }
+  .policy-badge.Allow   { background: #1a3a2a; color: var(--green); }
+  .policy-badge.Deny    { background: #3a1a1a; color: var(--red); }
+  .policy-badge.Confirm { background: #3a3010; color: var(--yellow); }
+  .chevron { color: var(--muted); font-size: 10px; transition: transform .2s; }
+  .tool-card.open .chevron { transform: rotate(90deg); }
+  .tool-card-body { display: none; padding: 8px 10px; border-top: 1px solid var(--border); }
+  .tool-card.open .tool-card-body { display: block; }
+  .tool-section { margin-bottom: 6px; }
+  .tool-section-label { color: var(--muted); font-size: 10px; text-transform: uppercase; letter-spacing: .06em; margin-bottom: 2px; }
+  .tool-section pre { white-space: pre-wrap; word-break: break-all; color: var(--text); line-height: 1.4; }
+
+  /* ── Input area ── */
+  #input-area { padding: 12px 16px; border-top: 1px solid var(--border); display: flex; gap: 8px; background: var(--bg); }
+  #prompt-input { flex: 1; background: var(--surface2); border: 1px solid var(--border); border-radius: var(--radius); padding: 8px 12px; color: var(--text); font-family: var(--sans); font-size: 14px; resize: none; outline: none; transition: border-color .15s; }
+  #prompt-input:focus { border-color: var(--accent); }
+  #prompt-input::placeholder { color: var(--muted); }
+  #send-btn { background: var(--accent); color: #fff; border: none; border-radius: var(--radius); padding: 8px 18px; font-size: 14px; font-weight: 600; cursor: pointer; transition: opacity .15s; white-space: nowrap; }
+  #send-btn:hover { opacity: .85; }
+  #send-btn:disabled { opacity: .4; cursor: not-allowed; }
+
+  /* ── Sidebar ── */
+  #sidebar h2 { font-size: 11px; font-weight: 700; letter-spacing: .08em; color: var(--muted); padding: 10px 12px 6px; text-transform: uppercase; border-bottom: 1px solid var(--border); }
+  #tool-log { flex: 1; overflow-y: auto; padding: 8px; display: flex; flex-direction: column; gap: 6px; }
+  .log-entry { background: var(--surface2); border: 1px solid var(--border); border-radius: 6px; padding: 7px 9px; font-family: var(--mono); font-size: 11px; }
+  .log-entry-top { display: flex; align-items: center; gap: 6px; margin-bottom: 3px; }
+  .log-tool-name { color: var(--accent); font-weight: 600; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .log-ts { color: var(--muted); font-size: 10px; }
+  .log-badge { font-size: 9px; font-weight: 700; padding: 1px 5px; border-radius: 20px; }
+  .log-badge.Allow   { background: #1a3a2a; color: var(--green); }
+  .log-badge.Deny    { background: #3a1a1a; color: var(--red); }
+  .log-badge.Confirm { background: #3a3010; color: var(--yellow); }
+
+  /* ── Stats bar ── */
+  .stat-item { display: flex; align-items: center; gap: 5px; }
+  .stat-label { color: var(--muted); }
+  .stat-val { color: var(--text); font-weight: 500; font-family: var(--mono); font-size: 12px; }
+
+  /* ── Scrollbars ── */
+  ::-webkit-scrollbar { width: 5px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+  ::-webkit-scrollbar-thumb:hover { background: var(--muted); }
+
+  /* ── Welcome message ── */
+  .welcome { align-self: center; text-align: center; color: var(--muted); padding: 40px 20px; }
+  .welcome h2 { font-size: 20px; color: var(--text); margin-bottom: 8px; }
+  .welcome p { line-height: 1.6; font-size: 13px; }
+</style>
+</head>
+<body>
+<div id="app">
+
+  <!-- Header -->
+  <header id="header">
+    <h1>Lumen Ora</h1>
+    <div id="model-toggle">
+      <button class="tier-badge smart" id="btn-smart" onclick="setTier('smart')" title="Qwen2.5-7B — slower, smarter">smart</button>
+      <button class="tier-badge" id="btn-fast" onclick="setTier('fast')" title="Qwen2.5-3B — faster">fast</button>
+    </div>
+    <div id="header-spacer"></div>
+    <div class="conn-dot" id="conn-dot" title="Bridge connection"></div>
+  </header>
+
+  <!-- Chat panel -->
+  <main id="chat">
+    <div id="messages">
+      <div class="welcome">
+        <h2>Lumen Ora</h2>
+        <p>An AI-native OS interface.<br>Type a message below to get started.<br>
+        Use <code>/model fast</code> or <code>/model smart</code> to switch models.</p>
+      </div>
+    </div>
+    <div id="input-area">
+      <textarea id="prompt-input" rows="1" placeholder="Ask Lumen anything… (Enter to send, Shift+Enter for newline)"></textarea>
+      <button id="send-btn" onclick="sendMessage()">Send</button>
+    </div>
+  </main>
+
+  <!-- Tool log sidebar -->
+  <aside id="sidebar">
+    <h2>Tool Log</h2>
+    <div id="tool-log">
+      <div style="color:var(--muted);font-size:11px;padding:8px;text-align:center;">No tool calls yet.</div>
+    </div>
+  </aside>
+
+  <!-- Stats bar -->
+  <footer id="statsbar">
+    <div class="stat-item"><span class="stat-label">session</span><span class="stat-val" id="stat-session">—</span></div>
+    <div class="stat-item"><span class="stat-label">turns</span><span class="stat-val" id="stat-turns">0</span></div>
+    <div class="stat-item"><span class="stat-label">tools</span><span class="stat-val" id="stat-tools">—</span></div>
+    <div class="stat-item"><span class="stat-label">smart model</span><span class="stat-val" id="stat-smart">—</span></div>
+    <div class="stat-item"><span class="stat-label">fast model</span><span class="stat-val" id="stat-fast">—</span></div>
+  </footer>
+
+</div>
+
+<script>
+// ---------------------------------------------------------------------------
+// State
+// ---------------------------------------------------------------------------
+let currentTier = 'smart';
+let turnCount = 0;
+let sessionId = null;
+let toolLogEntries = [];
+let currentSSE = null;
+let isStreaming = false;
+
+// ---------------------------------------------------------------------------
+// Model tier toggle
+// ---------------------------------------------------------------------------
+function setTier(tier) {
+  currentTier = tier;
+  document.getElementById('btn-smart').classList.toggle('smart', tier === 'smart');
+  document.getElementById('btn-fast').classList.toggle('fast', tier === 'fast');
+  // dim the non-active button
+  document.getElementById('btn-smart').style.opacity = tier === 'smart' ? '1' : '0.4';
+  document.getElementById('btn-fast').style.opacity  = tier === 'fast'  ? '1' : '0.4';
+}
+// Init toggle state
+setTier('smart');
+
+// ---------------------------------------------------------------------------
+// Session info polling
+// ---------------------------------------------------------------------------
+async function fetchSessionInfo() {
+  try {
+    const r = await fetch('/session-info');
+    if (!r.ok) return;
+    const data = await r.json();
+    document.getElementById('stat-tools').textContent  = data.tool_count ?? '—';
+    document.getElementById('stat-smart').textContent  = data.smart_model ? 'online' : 'offline';
+    document.getElementById('stat-fast').textContent   = data.fast_model  ? 'online' : 'offline';
+    document.getElementById('conn-dot').classList.add('connected');
+  } catch {
+    document.getElementById('conn-dot').classList.remove('connected');
+  }
+}
+fetchSessionInfo();
+setInterval(fetchSessionInfo, 5000);
+
+// ---------------------------------------------------------------------------
+// Message rendering
+// ---------------------------------------------------------------------------
+function makeId() {
+  return 'e' + Math.random().toString(36).slice(2,9);
+}
+
+function appendMessage(role, text, extra) {
+  // Remove welcome message on first chat msg
+  const welcome = document.querySelector('.welcome');
+  if (welcome) welcome.remove();
+
+  const msgs = document.getElementById('messages');
+  const id = makeId();
+
+  const div = document.createElement('div');
+  div.className = 'msg ' + role;
+  div.id = id;
+
+  const roleLabel = document.createElement('div');
+  roleLabel.className = 'msg-role';
+  roleLabel.textContent = role === 'user' ? 'You' : 'Lumen';
+  div.appendChild(roleLabel);
+
+  const bubble = document.createElement('div');
+  bubble.className = 'msg-bubble';
+  bubble.textContent = text;
+  div.appendChild(bubble);
+
+  // Tool call cards appended below the bubble
+  if (extra && extra.toolCards) {
+    extra.toolCards.forEach(c => div.appendChild(c));
+  }
+
+  msgs.appendChild(div);
+  msgs.scrollTop = msgs.scrollHeight;
+  return { id, bubble };
+}
+
+function appendUserMessage(text) {
+  appendMessage('user', text);
+}
+
+function startAIMessage() {
+  const { id, bubble } = appendMessage('ai', '');
+  bubble.classList.add('streaming');
+  return { id, bubble };
+}
+
+function finalizeAIMessage(bubble) {
+  bubble.classList.remove('streaming');
+}
+
+function appendToken(bubble, token) {
+  bubble.textContent += token;
+  const msgs = document.getElementById('messages');
+  msgs.scrollTop = msgs.scrollHeight;
+}
+
+// ---------------------------------------------------------------------------
+// Tool call card
+// ---------------------------------------------------------------------------
+function makeToolCard(toolName, params, policyDecision, result, error) {
+  const card = document.createElement('div');
+  card.className = 'tool-card';
+
+  const header = document.createElement('div');
+  header.className = 'tool-card-header';
+
+  const nameEl = document.createElement('span');
+  nameEl.className = 'tool-name';
+  nameEl.textContent = toolName;
+
+  const badge = document.createElement('span');
+  const dec = policyDecision || 'Allow';
+  badge.className = 'policy-badge ' + (dec === 'RequireConfirmation' ? 'Confirm' : dec);
+  badge.textContent = dec === 'RequireConfirmation' ? 'Confirm' : dec;
+
+  const chev = document.createElement('span');
+  chev.className = 'chevron';
+  chev.textContent = '▶';
+
+  header.appendChild(nameEl);
+  header.appendChild(badge);
+  header.appendChild(chev);
+  card.appendChild(header);
+
+  const body = document.createElement('div');
+  body.className = 'tool-card-body';
+
+  function section(label, content) {
+    const s = document.createElement('div');
+    s.className = 'tool-section';
+    const l = document.createElement('div');
+    l.className = 'tool-section-label';
+    l.textContent = label;
+    const pre = document.createElement('pre');
+    pre.textContent = typeof content === 'string' ? content : JSON.stringify(content, null, 2);
+    s.appendChild(l);
+    s.appendChild(pre);
+    body.appendChild(s);
+  }
+
+  if (params)  section('Params', params);
+  if (result)  section('Result', result);
+  if (error)   section('Error', error);
+
+  card.appendChild(body);
+
+  header.addEventListener('click', () => {
+    card.classList.toggle('open');
+  });
+
+  return card;
+}
+
+// ---------------------------------------------------------------------------
+// Tool log sidebar
+// ---------------------------------------------------------------------------
+function addToolLogEntry(toolName, decision) {
+  const log = document.getElementById('tool-log');
+
+  // Clear the placeholder
+  const placeholder = log.querySelector('div[style]');
+  if (placeholder) placeholder.remove();
+
+  const ts = new Date().toLocaleTimeString([], {hour:'2-digit', minute:'2-digit', second:'2-digit'});
+  const entry = document.createElement('div');
+  entry.className = 'log-entry';
+
+  const top = document.createElement('div');
+  top.className = 'log-entry-top';
+
+  const nameEl = document.createElement('span');
+  nameEl.className = 'log-tool-name';
+  nameEl.textContent = toolName;
+
+  const dec = decision || 'Allow';
+  const badge = document.createElement('span');
+  badge.className = 'log-badge ' + (dec === 'RequireConfirmation' ? 'Confirm' : dec);
+  badge.textContent = dec === 'RequireConfirmation' ? 'Confirm' : dec;
+
+  const tsEl = document.createElement('span');
+  tsEl.className = 'log-ts';
+  tsEl.textContent = ts;
+
+  top.appendChild(nameEl);
+  top.appendChild(badge);
+  top.appendChild(tsEl);
+  entry.appendChild(top);
+
+  // Prepend so newest is on top; keep max 10
+  log.insertBefore(entry, log.firstChild);
+  toolLogEntries.push(entry);
+  if (toolLogEntries.length > 10) {
+    const oldest = toolLogEntries.shift();
+    oldest.remove();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// SSE inference streaming
+// ---------------------------------------------------------------------------
+function sendMessage() {
+  const input = document.getElementById('prompt-input');
+  const prompt = input.value.trim();
+
+  // Handle slash commands locally
+  if (prompt.startsWith('/model ')) {
+    const tier = prompt.split(' ')[1].trim();
+    if (tier === 'fast' || tier === 'smart') {
+      setTier(tier);
+      appendUserMessage(prompt);
+      appendMessage('ai', `Switched to ${tier} model.`);
+      input.value = '';
+      autoResize(input);
+    }
+    return;
+  }
+
+  if (!prompt || isStreaming) return;
+
+  input.value = '';
+  autoResize(input);
+
+  appendUserMessage(prompt);
+  turnCount++;
+  document.getElementById('stat-turns').textContent = turnCount;
+
+  isStreaming = true;
+  document.getElementById('send-btn').disabled = true;
+
+  const { id, bubble } = startAIMessage();
+
+  // Close any existing SSE
+  if (currentSSE) { currentSSE.close(); currentSSE = null; }
+
+  const url = '/infer-stream?prompt=' + encodeURIComponent(prompt) + '&model_tier=' + currentTier;
+  const sse = new EventSource(url);
+  currentSSE = sse;
+
+  // Track pending tool calls for card attachment
+  let pendingTool = null;
+  let toolCards = [];
+  let msgEl = document.getElementById(id);
+
+  sse.addEventListener('session', e => {
+    const d = JSON.parse(e.data);
+    if (d.session_id && !sessionId) {
+      sessionId = d.session_id;
+      document.getElementById('stat-session').textContent = sessionId.slice(0, 8) + '…';
+    }
+  });
+
+  sse.addEventListener('token', e => {
+    const d = JSON.parse(e.data);
+    appendToken(bubble, d.token || '');
+  });
+
+  sse.addEventListener('policy', e => {
+    const d = JSON.parse(e.data);
+    pendingTool = { name: d.tool, decision: d.decision, params: null };
+    addToolLogEntry(d.tool, d.decision);
+  });
+
+  sse.addEventListener('tool_result', e => {
+    const d = JSON.parse(e.data);
+    const card = makeToolCard(
+      d.tool,
+      pendingTool ? pendingTool.params : null,
+      pendingTool ? pendingTool.decision : 'Allow',
+      d.result,
+      null
+    );
+    if (msgEl) msgEl.appendChild(card);
+    pendingTool = null;
+  });
+
+  sse.addEventListener('tool_error', e => {
+    const d = JSON.parse(e.data);
+    const card = makeToolCard(
+      d.tool,
+      pendingTool ? pendingTool.params : null,
+      pendingTool ? pendingTool.decision : 'Allow',
+      null,
+      d.error
+    );
+    if (msgEl) msgEl.appendChild(card);
+    pendingTool = null;
+  });
+
+  sse.addEventListener('tool_blocked', e => {
+    const d = JSON.parse(e.data);
+    const card = makeToolCard(d.tool, null, 'Deny', null, d.reason);
+    if (msgEl) msgEl.appendChild(card);
+  });
+
+  sse.addEventListener('done', e => {
+    finalizeAIMessage(bubble);
+    isStreaming = false;
+    document.getElementById('send-btn').disabled = false;
+    sse.close();
+    currentSSE = null;
+    const msgs = document.getElementById('messages');
+    msgs.scrollTop = msgs.scrollHeight;
+  });
+
+  sse.onerror = err => {
+    finalizeAIMessage(bubble);
+    if (!bubble.textContent.trim()) {
+      bubble.textContent = '[Connection error — is the bridge running on port 8765?]';
+    }
+    isStreaming = false;
+    document.getElementById('send-btn').disabled = false;
+    sse.close();
+    currentSSE = null;
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Input textarea auto-resize + Enter to send
+// ---------------------------------------------------------------------------
+function autoResize(el) {
+  el.style.height = 'auto';
+  el.style.height = Math.min(el.scrollHeight, 160) + 'px';
+}
+
+const input = document.getElementById('prompt-input');
+input.addEventListener('input', () => autoResize(input));
+input.addEventListener('keydown', e => {
+  if (e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault();
+    sendMessage();
+  }
+});
+</script>
+</body>
+</html>

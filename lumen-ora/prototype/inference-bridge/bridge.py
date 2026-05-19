@@ -27,6 +27,7 @@ import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from sse_starlette.sse import EventSourceResponse
 
@@ -639,6 +640,43 @@ async def evaluate_tool_endpoint(
 async def list_tools():
     """Return available tool schemas."""
     return {"tools": TOOL_SCHEMAS}
+
+
+@app.get("/")
+async def serve_dashboard():
+    """Serve the web UI dashboard."""
+    from fastapi.responses import HTMLResponse
+    static_file = Path(__file__).parent / "static" / "index.html"
+    if static_file.exists():
+        return HTMLResponse(static_file.read_text(encoding="utf-8"))
+    return HTMLResponse("<h1>Lumen Ora</h1><p>Place static/index.html next to bridge.py</p>")
+
+
+@app.get("/session-info")
+async def session_info():
+    """Return session metadata for the web UI."""
+    return {
+        "version": "0.1.0",
+        "smart_model": is_llama_running(),
+        "fast_model": is_fast_model_running(),
+        "tool_count": len(TOOL_SCHEMAS),
+    }
+
+
+@app.get("/infer-stream")
+async def infer_stream_get(prompt: str, model_tier: str = "smart"):
+    """GET endpoint for SSE streaming — easier to use from EventSource."""
+    request = InferenceRequest(prompt=prompt, stream=True, model_tier=model_tier)
+    return EventSourceResponse(stream_inference(request))
+
+
+# ---------------------------------------------------------------------------
+# Static file mount (must come AFTER all route definitions)
+# ---------------------------------------------------------------------------
+
+_static_dir = Path(__file__).parent / "static"
+_static_dir.mkdir(exist_ok=True)
+app.mount("/static", StaticFiles(directory=str(_static_dir)), name="static")
 
 
 # ---------------------------------------------------------------------------
