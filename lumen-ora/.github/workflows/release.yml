@@ -1,0 +1,63 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install httpx fastapi uvicorn sse-starlette pydantic rich ddgs pyttsx3 sounddevice soundfile keyboard pillow
+
+      - name: Run tool tests (Layer 2 only — no model needed)
+        run: |
+          cd prototype
+          python test_e2e.py --skip-bridge --skip-model
+        env:
+          PYTHONIOENCODING: utf-8
+
+  release:
+    needs: test
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create release archive
+        shell: pwsh
+        run: |
+          $version = "${{ github.ref_name }}"
+          $archiveName = "lumen-ora-$version-windows.zip"
+          # Include everything except models (too large) and build artifacts
+          Compress-Archive -Path `
+            "prototype/context-shell", `
+            "prototype/inference-bridge", `
+            "prototype/policy-engine/src", `
+            "prototype/policy-engine/Cargo.toml", `
+            "prototype/start.bat", `
+            "prototype/start.ps1", `
+            "prototype/setup.ps1", `
+            "prototype/test_e2e.py", `
+            "README.md", "CHANGELOG.md" `
+            -DestinationPath $archiveName
+          echo "ARCHIVE=$archiveName" >> $env:GITHUB_ENV
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.ARCHIVE }}
+          body_path: CHANGELOG.md
+          draft: false
+          prerelease: ${{ contains(github.ref_name, 'alpha') || contains(github.ref_name, 'beta') }}

@@ -1,0 +1,21 @@
+name: Tests
+
+on: [push, pull_request]
+
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install httpx fastapi uvicorn sse-starlette pydantic rich ddgs pyttsx3 sounddevice soundfile keyboard pillow
+
+      - name: Layer 2 tool tests
+        run: cd prototype && python test_e2e.py --skip-bridge --skip-model
+        env:
+          PYTHONIOENCODING: utf-8

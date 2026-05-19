@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import platform as _platform
 import queue
 import socket
 import subprocess
@@ -25,6 +26,12 @@ import time
 import uuid
 from datetime import datetime
 from pathlib import Path
+
+# ---------------------------------------------------------------------------
+# Platform detection — used throughout to guard OS-specific code paths
+# ---------------------------------------------------------------------------
+
+PLATFORM = _platform.system()   # "Windows", "Linux", or "Darwin"
 
 # ---------------------------------------------------------------------------
 # Optional readline (not available on Windows by default; graceful fallback)
@@ -212,8 +219,10 @@ def ensure_policy_engine() -> bool:
 
     1. If already running, return True immediately.
     2. If not, locate the binary (env var LUMEN_POLICY_BIN or default build path).
-    3. Start it via WSL2 and wait up to 5 s for port 8766 to open.
-    4. Returns True if up, False if unavailable (prints a dim warning, does NOT crash).
+    3. On Windows: start the binary via WSL2 (wsl -d Ubuntu-22.04).
+       On Linux/macOS: run the native binary directly (no WSL wrapper needed).
+    4. Wait up to 5 s for port 8766 to open.
+    5. Returns True if up, False if unavailable (prints a dim warning, does NOT crash).
     """
     global _policy_proc
 
@@ -221,37 +230,78 @@ def ensure_policy_engine() -> bool:
     if socket.connect_ex(("127.0.0.1", 8766)) == 0:
         return True
 
-    # --- Locate binary ---
-    wsl_binary: str | None = None
-
     env_bin = os.environ.get("LUMEN_POLICY_BIN", "").strip()
-    if env_bin:
-        wsl_binary = env_bin
+
+    if PLATFORM != "Windows":
+        # -----------------------------------------------------------------
+        # Linux / macOS: run the native Rust binary directly (no WSL needed)
+        # -----------------------------------------------------------------
+        if env_bin:
+            native_binary = Path(env_bin)
+        else:
+            native_binary = (
+                Path(__file__).parent.parent
+                / "policy-engine"
+                / "target"
+                / "debug"
+                / "policy-engine"
+            )
+
+        if not native_binary.exists():
+            console.print(
+                _dim(
+                    f"  [policy] Binary not found at {native_binary} — "
+                    "run: cd prototype/policy-engine && cargo build"
+                )
+            )
+            return False
+
+        try:
+            _policy_proc = subprocess.Popen(
+                [str(native_binary)],
+                env={**os.environ, "LUMEN_TCP_PORT": "8766"},
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except Exception as exc:
+            console.print(_dim(f"  [policy] Failed to start policy engine: {exc}"))
+            return False
+
     else:
-        # Default: <repo>/policy-engine/target/debug/policy-engine (WSL path)
-        default_win = Path(__file__).parent.parent / "policy-engine" / "target" / "debug" / "policy-engine"
-        wsl_binary = _win_path_to_wsl(default_win)
+        # -----------------------------------------------------------------
+        # Windows: wrap the binary in WSL2
+        # -----------------------------------------------------------------
+        if env_bin:
+            wsl_binary = env_bin
+        else:
+            default_win = (
+                Path(__file__).parent.parent
+                / "policy-engine"
+                / "target"
+                / "debug"
+                / "policy-engine"
+            )
+            wsl_binary = _win_path_to_wsl(default_win)
 
-    # --- Start it ---
-    try:
-        _policy_proc = subprocess.Popen(
-            [
-                "wsl", "-d", "Ubuntu-22.04", "--",
-                "env", "LUMEN_TCP_PORT=8766",
-                wsl_binary,
-            ],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-    except FileNotFoundError:
-        # wsl not found on this machine
-        console.print(_dim("  [policy] wsl not found — policy engine unavailable."))
-        return False
-    except Exception as exc:
-        console.print(_dim(f"  [policy] Failed to start policy engine: {exc}"))
-        return False
+        try:
+            _policy_proc = subprocess.Popen(
+                [
+                    "wsl", "-d", "Ubuntu-22.04", "--",
+                    "env", "LUMEN_TCP_PORT=8766",
+                    wsl_binary,
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except FileNotFoundError:
+            # wsl not found on this machine
+            console.print(_dim("  [policy] wsl not found — policy engine unavailable."))
+            return False
+        except Exception as exc:
+            console.print(_dim(f"  [policy] Failed to start policy engine: {exc}"))
+            return False
 
-    # --- Wait up to 5 s ---
+    # --- Wait up to 5 s for the port to open ---
     for _ in range(10):
         time.sleep(0.5)
         if socket.connect_ex(("127.0.0.1", 8766)) == 0:
