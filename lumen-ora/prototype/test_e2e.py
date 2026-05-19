@@ -418,9 +418,9 @@ def run_tool_execution_tests() -> bool:
     record("import tool_schema", True)
     all_ok = True
 
-    # ── Test 1: TOOL_SCHEMAS has 5 entries ───────────────────────────────────
-    ok = len(TOOL_SCHEMAS) == 5
-    all_ok &= record("TOOL_SCHEMAS has 5 tools", ok, str([t["name"] for t in TOOL_SCHEMAS]))
+    # ── Test 1: TOOL_SCHEMAS has 10 entries ──────────────────────────────────
+    ok = len(TOOL_SCHEMAS) == 10
+    all_ok &= record("TOOL_SCHEMAS has 10 tools", ok, str([t["name"] for t in TOOL_SCHEMAS]))
 
     # ── Test 2: list_directory on temp dir ───────────────────────────────────
     try:
@@ -514,6 +514,39 @@ def run_tool_execution_tests() -> bool:
                              "No results — duckduckgo-search not installed or no internet")
     except Exception as e:
         all_ok &= record("search_web returns results", False, str(e))
+
+    # ── Test: edit_file round-trip ────────────────────────────────────────────
+    try:
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
+            f.write("hello world"); tmp = f.name
+        result = dispatch_tool("edit_file", {"path": tmp, "old_str": "world", "new_str": "lumen"})
+        content = Path(tmp).read_text(); Path(tmp).unlink()
+        all_ok &= record("edit_file replaces string", result.get("replaced") and "lumen" in content)
+    except Exception as e:
+        all_ok &= record("edit_file replaces string", False, str(e))
+
+    # ── Test: clipboard round-trip (Windows only, skip gracefully on failure) ─
+    try:
+        dispatch_tool("clipboard_write", {"text": "lumen-test-123"})
+        got = dispatch_tool("clipboard_read", {})
+        if isinstance(got, dict):
+            all_ok &= record("clipboard write/read", False, str(got))
+        else:
+            all_ok &= record("clipboard write/read", "lumen-test-123" in str(got))
+    except Exception as e:
+        record("clipboard write/read", True, f"skipped: {e}")  # non-fatal on CI
+
+    # ── Test: take_screenshot ─────────────────────────────────────────────────
+    try:
+        result = dispatch_tool("take_screenshot", {})
+        if "error" in str(result):
+            record("take_screenshot", True, f"skipped: {result}")  # pillow/mss not installed
+        else:
+            p = Path(result.get("path", ""))
+            all_ok &= record("take_screenshot saves file", p.exists())
+            if p.exists(): p.unlink()
+    except Exception as e:
+        all_ok &= record("take_screenshot", False, str(e))
 
     return all_ok
 

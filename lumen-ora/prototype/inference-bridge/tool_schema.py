@@ -1,11 +1,12 @@
 """
 Lumen Ora — Tool Schema Definitions
-Defines the 5 core tools available to the AI model.
+Defines the 10 core tools available to the AI model.
 All tools must pass through the Policy Engine before execution.
 """
 
 from __future__ import annotations
 
+import datetime
 import os
 import subprocess
 import time
@@ -44,6 +45,27 @@ class SearchWebParams(BaseModel):
 class ListDirectoryParams(BaseModel):
     path: str = Field(..., description="Directory path to list.")
     show_hidden: bool = Field(False, description="Whether to include hidden files/dirs.")
+
+
+class EditFileParams(BaseModel):
+    path: str = Field(..., description="Absolute or home-relative path to the file to edit.")
+    old_str: str = Field(..., description="The string to find and replace (first occurrence).")
+    new_str: str = Field(..., description="The replacement string.")
+
+
+class ClipboardWriteParams(BaseModel):
+    text: str = Field(..., description="Text to write to the clipboard.")
+
+
+class OpenAppParams(BaseModel):
+    name: str = Field(..., description="Application name or path to launch (e.g. 'notepad', 'calc').")
+
+
+class TakeScreenshotParams(BaseModel):
+    filename: str | None = Field(
+        None,
+        description="Output filename. Defaults to ~/.lumen/screenshots/YYYY-MM-DD_HH-MM-SS.png.",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -172,6 +194,92 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                 },
             },
             "required": ["path"],
+        },
+    },
+    {
+        "name": "edit_file",
+        "description": (
+            "Edit a file by replacing the FIRST occurrence of old_str with new_str. "
+            "Returns {replaced: true, path: ...} on success or {replaced: false, error: ...} if not found."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Absolute or home-relative path to the file to edit.",
+                },
+                "old_str": {
+                    "type": "string",
+                    "description": "The string to find (first occurrence will be replaced).",
+                },
+                "new_str": {
+                    "type": "string",
+                    "description": "The replacement string.",
+                },
+            },
+            "required": ["path", "old_str", "new_str"],
+        },
+    },
+    {
+        "name": "clipboard_read",
+        "description": "Read the current contents of the system clipboard. Returns the clipboard text.",
+        "parameters": {
+            "type": "object",
+            "properties": {},
+            "required": [],
+        },
+    },
+    {
+        "name": "clipboard_write",
+        "description": "Write text to the system clipboard. Returns {written: true} on success.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "text": {
+                    "type": "string",
+                    "description": "Text to place on the clipboard.",
+                },
+            },
+            "required": ["text"],
+        },
+    },
+    {
+        "name": "open_app",
+        "description": (
+            "Launch an application by name (e.g. 'notepad', 'calc', 'chrome'). "
+            "Returns {launched: name} immediately without waiting for the process."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "Application name or path to launch.",
+                },
+            },
+            "required": ["name"],
+        },
+    },
+    {
+        "name": "take_screenshot",
+        "description": (
+            "Take a screenshot and save it to disk. "
+            "Returns {path, width, height} on success. "
+            "Requires pillow or mss to be installed."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "filename": {
+                    "type": "string",
+                    "description": (
+                        "Output file path. Defaults to "
+                        "~/.lumen/screenshots/YYYY-MM-DD_HH-MM-SS.png."
+                    ),
+                },
+            },
+            "required": [],
         },
     },
 ]
@@ -338,6 +446,96 @@ def execute_list_directory(params: ListDirectoryParams) -> list[DirectoryEntry]:
     return entries
 
 
+def execute_edit_file(params: EditFileParams) -> dict[str, Any]:
+    """Replace the first occurrence of old_str with new_str in a file."""
+    p = Path(params.path).expanduser()
+    try:
+        original = p.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        return {"replaced": False, "error": str(exc)}
+    if params.old_str not in original:
+        return {"replaced": False, "error": "string not found"}
+    updated = original.replace(params.old_str, params.new_str, 1)
+    p.write_text(updated, encoding="utf-8")
+    return {"replaced": True, "path": str(p)}
+
+
+def execute_clipboard_read(_params: Any) -> Any:
+    """Read text from the Windows clipboard via PowerShell."""
+    try:
+        result = subprocess.run(
+            ["powershell", "-command", "Get-Clipboard"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if result.returncode != 0:
+            return {"error": f"clipboard unavailable: {result.stderr.strip()}"}
+        return result.stdout.strip()
+    except Exception as exc:
+        return {"error": f"clipboard unavailable: {exc}"}
+
+
+def execute_clipboard_write(params: ClipboardWriteParams) -> dict[str, Any]:
+    """Write text to the Windows clipboard via clip.exe."""
+    try:
+        subprocess.run(
+            ["clip"],
+            input=params.text.encode("utf-16-le"),
+            check=True,
+            timeout=10,
+        )
+        return {"written": True}
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
+def execute_open_app(params: OpenAppParams) -> dict[str, Any]:
+    """Launch an application by name without waiting for it to exit."""
+    try:
+        subprocess.Popen(["start", params.name], shell=True)
+        return {"launched": params.name}
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
+def execute_take_screenshot(params: TakeScreenshotParams) -> dict[str, Any]:
+    """Take a screenshot and save it; requires pillow or mss."""
+    # Determine output filepath
+    if params.filename:
+        filepath = Path(params.filename).expanduser()
+    else:
+        screenshots_dir = Path.home() / ".lumen" / "screenshots"
+        screenshots_dir.mkdir(parents=True, exist_ok=True)
+        ts = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        filepath = screenshots_dir / f"{ts}.png"
+
+    filepath.parent.mkdir(parents=True, exist_ok=True)
+
+    # Try pillow first
+    try:
+        from PIL import ImageGrab  # type: ignore
+        img = ImageGrab.grab()
+        img.save(str(filepath))
+        w, h = img.size
+        return {"path": str(filepath), "width": w, "height": h}
+    except ImportError:
+        pass
+
+    # Fallback to mss
+    try:
+        import mss  # type: ignore
+        with mss.mss() as sct:
+            monitor = sct.monitors[0]  # full virtual screen
+            shot = sct.grab(monitor)
+            sct.shot(output=str(filepath))
+            return {"path": str(filepath), "width": shot.width, "height": shot.height}
+    except ImportError:
+        pass
+
+    return {"error": "Install pillow or mss: pip install pillow"}
+
+
 # ---------------------------------------------------------------------------
 # Dispatcher
 # ---------------------------------------------------------------------------
@@ -348,6 +546,11 @@ TOOL_EXECUTORS = {
     "run_command": lambda p: execute_run_command(RunCommandParams(**p)),
     "search_web": lambda p: execute_search_web(SearchWebParams(**p)),
     "list_directory": lambda p: execute_list_directory(ListDirectoryParams(**p)),
+    "edit_file": lambda p: execute_edit_file(EditFileParams(**p)),
+    "clipboard_read": lambda p: execute_clipboard_read(p),
+    "clipboard_write": lambda p: execute_clipboard_write(ClipboardWriteParams(**p)),
+    "open_app": lambda p: execute_open_app(OpenAppParams(**p)),
+    "take_screenshot": lambda p: execute_take_screenshot(TakeScreenshotParams(**p)),
 }
 
 

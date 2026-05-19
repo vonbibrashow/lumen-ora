@@ -47,6 +47,25 @@ if %errorlevel% equ 0 (
     timeout /t 8 /nobreak >nul
 )
 
+:: ── 1b. Fast model (3B) on port 8081 — optional ─────────────────────────────
+echo [lumen] Checking fast model (port 8081)...
+netstat -ano | findstr ":8081 " >nul 2>&1
+if %errorlevel% equ 0 (
+    echo [lumen] Fast model already running.
+) else (
+    if exist "%PROTO%\inference-bridge\models\qwen2.5-3b-instruct-q4_k_m.gguf" (
+        echo [lumen] Starting fast model (3B)...
+        start "llama-server-fast" "%PROTO%\inference-bridge\llama-cpp\llama-server.exe" ^
+            --model "%PROTO%\inference-bridge\models\qwen2.5-3b-instruct-q4_k_m.gguf" ^
+            --ctx-size 4096 ^
+            --host 127.0.0.1 ^
+            --port 8081
+        timeout /t 5 /nobreak >nul
+    ) else (
+        echo [lumen] 3B model not found — skipping fast model.
+    )
+)
+
 :: ── 2. Inference bridge on port 8765 ─────────────────────────────────────────
 echo [lumen] Checking inference bridge (port 8765)...
 netstat -ano | findstr ":8765 " >nul 2>&1

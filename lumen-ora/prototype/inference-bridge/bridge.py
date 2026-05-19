@@ -47,6 +47,8 @@ log = logging.getLogger("lumen.bridge")
 # ---------------------------------------------------------------------------
 
 LLAMA_SERVER_URL = os.environ.get("LLAMA_SERVER_URL", "http://127.0.0.1:8080")
+LLAMA_SERVER_URL_SMART = os.environ.get("LLAMA_SERVER_URL_SMART", LLAMA_SERVER_URL)
+LLAMA_SERVER_URL_FAST  = os.environ.get("LLAMA_SERVER_URL_FAST",  "http://127.0.0.1:8081")
 # POLICY_ENGINE_SOCKET can be:
 #   - A Unix socket path (Linux/macOS production): /tmp/lumen-policy.sock
 #   - A TCP address prefixed with "tcp://": tcp://127.0.0.1:8766 (Windows dev)
@@ -93,6 +95,7 @@ class InferenceRequest(BaseModel):
     stream: bool = Field(True, description="Whether to stream the response via SSE.")
     max_tokens: int = Field(512, description="Max tokens to generate.")
     temperature: float = Field(0.7)
+    model_tier: str = Field("smart", description="'fast' (3B) or 'smart' (7B). Default: smart.")
 
 
 class PolicyEvalResult(BaseModel):
@@ -204,6 +207,14 @@ async def evaluate_tool_call_policy(
 
 
 # ---------------------------------------------------------------------------
+# Model tier routing
+# ---------------------------------------------------------------------------
+
+def _llama_url_for_tier(tier: str) -> str:
+    return LLAMA_SERVER_URL_FAST if tier == "fast" else LLAMA_SERVER_URL_SMART
+
+
+# ---------------------------------------------------------------------------
 # llama.cpp interaction
 # ---------------------------------------------------------------------------
 
@@ -258,11 +269,14 @@ async def query_llama(
     temperature: float,
     stream: bool,
     conversation_suffix: str = "",
+    llama_url: str = "",
 ) -> AsyncIterator[str]:
     """
     POST to llama-server's /completion endpoint and yield token chunks.
     Uses Qwen2.5 chat template (<|im_start|>/<|im_end|>).
     """
+    if not llama_url:
+        llama_url = LLAMA_SERVER_URL_SMART
     full_prompt = _build_qwen_prompt(prompt, prior_messages, tools, conversation_suffix)
 
     payload = {
@@ -274,7 +288,7 @@ async def query_llama(
     }
 
     async with httpx.AsyncClient(timeout=120.0) as client:
-        async with client.stream("POST", f"{LLAMA_SERVER_URL}/completion", json=payload) as resp:
+        async with client.stream("POST", f"{llama_url}/completion", json=payload) as resp:
             resp.raise_for_status()
             async for line in resp.aiter_lines():
                 if line.startswith("data: "):
@@ -330,6 +344,7 @@ async def run_inference(request: InferenceRequest) -> InferenceResponse:
     """
     log.info("Session %s — inference start", request.session_id)
 
+    llama_url = _llama_url_for_tier(request.model_tier)
     tool_results: list[ToolCallResult] = []
     # conversation_suffix accumulates tool call/result turns within this request
     conversation_suffix = ""
@@ -349,6 +364,7 @@ async def run_inference(request: InferenceRequest) -> InferenceResponse:
             request.temperature,
             stream=False,
             conversation_suffix=conversation_suffix,
+            llama_url=llama_url,
         ):
             accumulated += token
 
@@ -450,6 +466,7 @@ async def stream_inference(request: InferenceRequest) -> AsyncIterator[dict[str,
     """
     yield {"event": "session", "data": json.dumps({"session_id": request.session_id})}
 
+    llama_url = _llama_url_for_tier(request.model_tier)
     conversation_suffix = ""
     MAX_ITERATIONS = 5
 
@@ -464,6 +481,7 @@ async def stream_inference(request: InferenceRequest) -> AsyncIterator[dict[str,
             request.temperature,
             stream=True,
             conversation_suffix=conversation_suffix,
+            llama_url=llama_url,
         ):
             accumulated += token
             yield {"event": "token", "data": json.dumps({"token": token})}
@@ -544,13 +562,43 @@ async def stream_inference(request: InferenceRequest) -> AsyncIterator[dict[str,
 
 
 # ---------------------------------------------------------------------------
+# Model liveness helpers
+# ---------------------------------------------------------------------------
+
+def is_llama_running() -> bool:
+    """Return True if the smart model (port 8080) is accepting connections."""
+    import socket as _socket
+    try:
+        with _socket.create_connection(("127.0.0.1", 8080), timeout=1.0):
+            return True
+    except OSError:
+        return False
+
+
+def is_fast_model_running() -> bool:
+    """Return True if the fast model (port 8081) is accepting connections."""
+    import socket as _socket
+    try:
+        with _socket.create_connection(("127.0.0.1", 8081), timeout=1.0):
+            return True
+    except OSError:
+        return False
+
+
+# ---------------------------------------------------------------------------
 # HTTP endpoints
 # ---------------------------------------------------------------------------
 
 @app.get("/health")
 async def health():
     """Liveness probe."""
-    return {"status": "ok", "service": "lumen-inference-bridge", "version": "0.1.0"}
+    return {
+        "status": "ok",
+        "service": "lumen-inference-bridge",
+        "version": "0.1.0",
+        "smart_model": is_llama_running(),
+        "fast_model": is_fast_model_running(),
+    }
 
 
 @app.post("/infer")

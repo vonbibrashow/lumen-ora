@@ -36,6 +36,9 @@ function Test-PortListening {
     return $result
 }
 
+# Shared paths used by both model-server sections.
+$llamaExe = Join-Path $Proto "inference-bridge\llama-cpp\llama-server.exe"
+
 # ── 1. llama-server on port 8080 ───────────────────────────────────────────────
 Write-Host ""
 Write-Host "[lumen] Checking llama-server (port 8080)..."
@@ -43,13 +46,28 @@ if (Test-PortListening -Port 8080) {
     Write-Host "[lumen] llama-server already running."
 } else {
     Write-Host "[lumen] Starting llama-server..."
-    $llamaExe  = Join-Path $Proto "inference-bridge\llama-cpp\llama-server.exe"
     $llamaModel = Join-Path $Proto "inference-bridge\models\qwen2.5-7b-instruct-q4_k_m.gguf"
     Start-Process -FilePath $llamaExe `
         -ArgumentList "--model `"$llamaModel`" --ctx-size 4096 --host 127.0.0.1 --port 8080" `
         -WindowStyle Normal
     Write-Host "[lumen] Waiting 8 s for the model to load..."
     Start-Sleep -Seconds 8
+}
+
+# ── 1b. Fast model (3B) on port 8081 — optional ────────────────────────────
+Write-Host "[lumen] Checking fast model (port 8081)..."
+$fastModel = Join-Path $Proto "inference-bridge\models\qwen2.5-3b-instruct-q4_k_m.gguf"
+if (Test-PortListening -Port 8081) {
+    Write-Host "[lumen] Fast model already running."
+} elseif (Test-Path $fastModel) {
+    Write-Host "[lumen] Starting fast model (3B)..."
+    Start-Process -FilePath $llamaExe `
+        -ArgumentList "--model `"$fastModel`" --ctx-size 4096 --host 127.0.0.1 --port 8081" `
+        -WindowStyle Normal
+    Write-Host "[lumen] Waiting 5 s for fast model to load..."
+    Start-Sleep -Seconds 5
+} else {
+    Write-Host "[lumen] 3B model not found — skipping fast model."
 }
 
 # ── 2. Inference bridge on port 8765 ───────────────────────────────────────────

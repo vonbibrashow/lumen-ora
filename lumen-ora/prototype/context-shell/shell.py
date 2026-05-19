@@ -140,6 +140,7 @@ POLICY_PORT = int(os.environ.get("LUMEN_POLICY_PORT", "8766"))
 LUMEN_DIR = Path.home() / ".lumen"
 SESSION_FILE = LUMEN_DIR / "session_id"
 HISTORY_FILE = LUMEN_DIR / "history.jsonl"
+MEMORY_FILE = Path.home() / ".lumen" / "memory.jsonl"
 
 TIMEOUT_SECONDS = 120
 MAX_HISTORY_TURNS = 20
@@ -354,6 +355,47 @@ def trim_history() -> None:
             f.write(json.dumps(e) + "\n")
 
 # ---------------------------------------------------------------------------
+# Long-term memory — ~/.lumen/memory.jsonl
+# ---------------------------------------------------------------------------
+
+# Module-level memory state and model tier
+_memory: list[dict] = []
+_model_tier: str = "smart"
+
+
+def load_memory(max_facts: int = 20) -> list[dict]:
+    """Load the most recent max_facts entries from ~/.lumen/memory.jsonl."""
+    if not MEMORY_FILE.exists():
+        return []
+    lines = MEMORY_FILE.read_text(encoding="utf-8").splitlines()
+    facts = []
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            facts.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return facts[-max_facts:]
+
+
+def save_memory_fact(fact: str, tag: str = "general") -> None:
+    """Append a single fact to ~/.lumen/memory.jsonl."""
+    MEMORY_FILE.parent.mkdir(parents=True, exist_ok=True)
+    entry = {"fact": fact, "tag": tag, "created": time.strftime("%Y-%m-%dT%H:%M:%S")}
+    with MEMORY_FILE.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(entry) + "\n")
+
+
+def build_memory_context(facts: list[dict]) -> str:
+    """Build a memory context string to prepend to the system prompt."""
+    if not facts:
+        return ""
+    lines = [f"- {f['fact']}" for f in facts]
+    return "Known facts about the user:\n" + "\n".join(lines)
+
+# ---------------------------------------------------------------------------
 # Connectivity checks
 # ---------------------------------------------------------------------------
 
@@ -433,12 +475,24 @@ def call_bridge(prompt: str, session_id: str, messages: list[dict] | None = None
     """
     POST /infer to the bridge.
     messages is the prior conversation context [{role, content}, ...].
+    Prepends long-term memory context and passes model_tier.
     """
+    conversation = messages or []
+    memory_ctx = build_memory_context(_memory)
+    if memory_ctx:
+        messages_to_send = [
+            {"role": "user", "content": f"[Context]\n{memory_ctx}"},
+            {"role": "assistant", "content": "Understood."},
+        ] + conversation
+    else:
+        messages_to_send = conversation
+
     payload = {
         "prompt": prompt,
         "session_id": session_id,
         "stream": False,
-        "messages": messages or [],
+        "messages": messages_to_send,
+        "model_tier": _model_tier,
     }
     try:
         r = httpx.post(
@@ -1070,19 +1124,23 @@ def camera_is_running() -> bool:
 
 def cmd_help(voice_mode: bool = False) -> None:
     lines = [
-        "[bold]/help[/bold]          — show this help",
-        "[bold]/exit[/bold]          — exit the shell (also Ctrl+D)",
-        "[bold]/quit[/bold]          — exit the shell",
-        "[bold]/clear[/bold]         — clear screen and reset display",
-        "[bold]/new[/bold]           — start a fresh conversation (clears context)",
-        "[bold]/history[/bold]       — show last 10 exchanges",
-        "[bold]/session[/bold]       — show session ID and history stats",
-        "[bold]/model[/bold]         — show which model is loaded",
-        "[bold]/voice on[/bold]      — enable voice mode (STT + TTS)",
-        "[bold]/voice off[/bold]     — disable voice mode",
-        "[bold]/voice check[/bold]   — check voice subsystem (mic, STT, TTS)",
-        "[bold]/camera on[/bold]     — enable camera gesture + lip-VAD input",
-        "[bold]/camera off[/bold]    — disable camera gesture + lip-VAD input",
+        "[bold]/help[/bold]              — show this help",
+        "[bold]/exit[/bold]              — exit the shell (also Ctrl+D)",
+        "[bold]/quit[/bold]              — exit the shell",
+        "[bold]/clear[/bold]             — clear screen and reset display",
+        "[bold]/new[/bold]               — start a fresh conversation (clears context)",
+        "[bold]/history[/bold]           — show last 10 exchanges",
+        "[bold]/session[/bold]           — show session ID and history stats",
+        "[bold]/model fast|smart[/bold]  — switch model tier: fast (3B) or smart (7B)",
+        "[bold]/model[/bold]             — show current model tier",
+        "[bold]/remember <fact>[/bold]   — save a fact to long-term memory",
+        "[bold]/memory[/bold]            — list all remembered facts",
+        "[bold]/forget <n>[/bold]        — remove fact at index n from memory",
+        "[bold]/voice on[/bold]          — enable voice mode (STT + TTS)",
+        "[bold]/voice off[/bold]         — disable voice mode",
+        "[bold]/voice check[/bold]       — check voice subsystem (mic, STT, TTS)",
+        "[bold]/camera on[/bold]         — enable camera gesture + lip-VAD input",
+        "[bold]/camera off[/bold]        — disable camera gesture + lip-VAD input",
     ]
     console.print(
         Panel(
@@ -1181,12 +1239,29 @@ def cmd_history() -> None:
         console.print()
 
 
-def cmd_model() -> None:
+def cmd_model(tier: str | None = None) -> None:
+    global _model_tier
+    if tier == "fast":
+        _model_tier = "fast"
+        console.print(_green("Switched to fast model (3B)"))
+        return
+    if tier == "smart":
+        _model_tier = "smart"
+        console.print(_green("Switched to smart model (7B)"))
+        return
+    # Show current state
     bridge_ok, detail = check_bridge()
+    tier_label = "fast (3B)" if _model_tier == "fast" else "smart (7B)"
     if bridge_ok:
-        console.print(f"Model: [cyan]{MODEL_NAME}[/cyan]  [dim](bridge: {detail})[/dim]")
+        console.print(
+            f"Model tier: [cyan]{tier_label}[/cyan]  "
+            f"[dim]base: {MODEL_NAME}  bridge: {detail}[/dim]"
+        )
     else:
-        console.print(_red(f"Bridge not reachable: {detail}"))
+        console.print(
+            f"Model tier: [cyan]{tier_label}[/cyan]  "
+            + _red(f"(bridge not reachable: {detail})")
+        )
 
 
 def cmd_session(session_id: str, conversation: list[dict]) -> None:
@@ -1209,6 +1284,7 @@ def handle_special(
     voice_state is a mutable dict with key 'enabled' (bool).
     camera_state is a mutable dict with key 'enabled' (bool).
     """
+    global _memory
     stripped = cmd.strip()
     if not stripped.startswith("/"):
         return False
@@ -1240,7 +1316,45 @@ def handle_special(
         return True
 
     if verb == "/model":
-        cmd_model()
+        cmd_model(rest if rest in ("fast", "smart") else None)
+        return True
+
+    if verb == "/remember":
+        if not rest:
+            console.print(_dim("Usage: /remember <fact>"))
+            return True
+        save_memory_fact(rest)
+        _memory = load_memory()
+        console.print(_green(f"Remembered: {rest}"))
+        return True
+
+    if verb == "/memory":
+        if not _memory:
+            console.print(_dim("No facts in memory yet. Use /remember <fact> to add one."))
+        else:
+            for i, f in enumerate(_memory):
+                tag = f.get("tag", "general")
+                created = f.get("created", "")[:10]
+                console.print(f"  [dim]{i}.[/dim] {f['fact']}  [dim][{tag}  {created}][/dim]")
+        return True
+
+    if verb == "/forget":
+        if not rest.strip().isdigit():
+            console.print(_dim("Usage: /forget <n>  (use /memory to list indices)"))
+            return True
+        idx = int(rest.strip())
+        all_facts = load_memory(max_facts=9999)
+        if idx < 0 or idx >= len(all_facts):
+            console.print(_red(f"Index {idx} out of range (0–{len(all_facts) - 1})."))
+            return True
+        removed = all_facts.pop(idx)
+        # Rewrite the file without that line
+        MEMORY_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with MEMORY_FILE.open("w", encoding="utf-8") as _f:
+            for _entry in all_facts:
+                _f.write(json.dumps(_entry) + "\n")
+        _memory = load_memory()
+        console.print(_dim(f"Forgotten: {removed['fact']}"))
         return True
 
     if verb == "/help":
@@ -1496,8 +1610,15 @@ def _drain_camera_events(
 
 def repl(session_id: str, start_voice: bool = False, start_cam_input: bool = False) -> None:
     """Main read-eval-print loop."""
+    global _memory
+
     # In-memory conversation for multi-turn context (trimmed to MAX_CONTEXT_TURNS)
     conversation: list[dict] = []
+
+    # Load long-term memory
+    _memory = load_memory()
+    if _memory:
+        console.print(f"  [dim]Memory: {len(_memory)} fact(s) loaded[/dim]")
 
     # Mutable voice state — passed to handle_special so /voice on/off works
     voice_state: dict = {"enabled": start_voice and _VOICE_DEPS_OK}
@@ -1682,10 +1803,20 @@ def main() -> None:
         action="store_true",
         help="Enable camera gesture + lip-VAD input at startup.",
     )
+    parser.add_argument(
+        "--model",
+        choices=["fast", "smart"],
+        default="smart",
+        help="Model tier: fast (3B, ~18s) or smart (7B, ~70s). Default: smart.",
+    )
     args = parser.parse_args()
 
     if args.check:
         sys.exit(run_check())
+
+    # --- Model tier ---
+    global _model_tier
+    _model_tier = args.model
 
     # --- Voice mode startup validation ---
     start_voice = args.voice
