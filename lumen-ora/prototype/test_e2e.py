@@ -29,6 +29,13 @@ import time
 from pathlib import Path
 from typing import Any
 
+# Ensure stdout can handle Unicode box-drawing characters on Windows
+if sys.stdout.encoding and sys.stdout.encoding.lower() not in ("utf-8", "utf-16"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 # ---------------------------------------------------------------------------
 # Colour helpers (works on Windows 10+ terminal)
 # ---------------------------------------------------------------------------
@@ -741,9 +748,9 @@ def run_bridge_tests(skip_model: bool = True) -> tuple[bool, subprocess.Popen | 
     try:
         status, body = bridge_get("/tools")
         tools = body.get("tools", [])
-        ok = status == 200 and len(tools) == 5
+        ok = status == 200 and len(tools) >= 10
         names = [t["name"] for t in tools]
-        all_ok &= record("GET /tools returns 5 schemas", ok, str(names))
+        all_ok &= record("GET /tools returns 10 schemas", ok, str(names))
     except Exception as e:
         all_ok &= record("GET /tools", False, str(e))
 
@@ -774,7 +781,7 @@ def run_bridge_tests(skip_model: bool = True) -> tuple[bool, subprocess.Popen | 
     # When llama-server is running we need a generous timeout (7B on CPU is slow).
     # When it's not running we expect a fast 503; 10 s is plenty.
     _model_up = is_llama_running()
-    _infer_timeout = 150 if _model_up else 10
+    _infer_timeout = 360 if _model_up else 10
     if skip_model or _model_up:
         try:
             status, body = bridge_post("/infer", {

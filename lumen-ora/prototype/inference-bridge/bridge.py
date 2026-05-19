@@ -288,7 +288,7 @@ async def query_llama(
         "stop": ["<|im_end|>", "<|im_start|>"],
     }
 
-    async with httpx.AsyncClient(timeout=120.0) as client:
+    async with httpx.AsyncClient(timeout=300.0) as client:
         async with client.stream("POST", f"{llama_url}/completion", json=payload) as resp:
             resp.raise_for_status()
             async for line in resp.aiter_lines():
