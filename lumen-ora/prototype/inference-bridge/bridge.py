@@ -59,6 +59,13 @@ POLICY_SOCKET_PATH = os.environ.get("POLICY_ENGINE_SOCKET", "tcp://127.0.0.1:876
 BRIDGE_HOST = os.environ.get("BRIDGE_HOST", "127.0.0.1")
 BRIDGE_PORT = int(os.environ.get("BRIDGE_PORT", "8765"))
 
+# LUMEN_BIND_HOST overrides BRIDGE_HOST when set. Use this for remote access
+# (e.g. over Tailscale): LUMEN_BIND_HOST=0.0.0.0 makes the bridge listen on
+# every interface, including the tailnet. Default 127.0.0.1 keeps single-user
+# local installs safe by construction. See INSTALL.md → "Remote access via
+# Tailscale" for the recommended setup.
+LUMEN_BIND_HOST = os.environ.get("LUMEN_BIND_HOST", "").strip()
+
 # Optional API token auth. If LUMEN_API_TOKEN is set, all protected endpoints
 # (/infer, /infer-stream, /evaluate_tool) require Authorization: Bearer <token>.
 # If unset, no auth is enforced (back-compat with single-user local mode).
@@ -786,11 +793,38 @@ if __name__ == "__main__":
     LLAMA_SERVER_URL = args.llama_url
     POLICY_SOCKET_PATH = args.policy_socket
 
+    # LUMEN_BIND_HOST env var wins over --host / BRIDGE_HOST when set.
+    # This is the knob users flip to expose the bridge over Tailscale.
+    bind_host = LUMEN_BIND_HOST or args.host
+
     if args.model:
         start_llama_server(args.model, gpu_layers=args.gpu_layers)
 
-    log.info("Lumen Ora Inference Bridge starting on %s:%d", args.host, args.port)
+    log.info("Lumen Ora Inference Bridge starting on %s:%d", bind_host, args.port)
     log.info("Policy Engine socket: %s", POLICY_SOCKET_PATH)
     log.info("llama.cpp URL: %s", LLAMA_SERVER_URL)
 
-    uvicorn.run(app, host=args.host, port=args.port)
+    # Loud warning if we're listening on every interface without auth.
+    # Anyone on the LAN / tailnet can hit the bridge in this state.
+    if bind_host in ("0.0.0.0", "::", "::0") and not LUMEN_API_TOKEN:
+        log.warning("=" * 70)
+        log.warning(
+            "WARNING: bridge bound to %s without auth — anyone on your LAN "
+            "can use it. Set LUMEN_API_TOKEN=<long-random-string> before "
+            "exposing this port over Tailscale or any other network.",
+            bind_host,
+        )
+        log.warning("=" * 70)
+        # Also print to stderr so it surfaces even if logging is reconfigured.
+        print(
+            f"\n!! WARNING: bridge bound to {bind_host} without auth — "
+            f"anyone on your LAN can use it.\n"
+            f"!! Set LUMEN_API_TOKEN=<long-random-string> before exposing "
+            f"this port.\n",
+            file=sys.stderr,
+            flush=True,
+        )
+    elif bind_host in ("0.0.0.0", "::", "::0"):
+        log.info("Bridge bound to %s with LUMEN_API_TOKEN auth enabled.", bind_host)
+
+    uvicorn.run(app, host=bind_host, port=args.port)

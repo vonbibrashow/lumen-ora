@@ -8,12 +8,18 @@ from __future__ import annotations
 
 import datetime
 import os
+import platform
 import subprocess
 import time
 from pathlib import Path
 from typing import Any
 
 from pydantic import BaseModel, Field
+
+# Cached platform check — used by clipboard, screenshot, and other
+# OS-conditional code paths. platform.system() returns 'Windows',
+# 'Linux', or 'Darwin'.
+_IS_WINDOWS = platform.system() == "Windows"
 
 
 # ---------------------------------------------------------------------------
@@ -461,33 +467,65 @@ def execute_edit_file(params: EditFileParams) -> dict[str, Any]:
 
 
 def execute_clipboard_read(_params: Any) -> Any:
-    """Read text from the Windows clipboard via PowerShell."""
+    """
+    Read text from the system clipboard.
+    Windows: uses PowerShell Get-Clipboard (no extra deps).
+    Linux/macOS: uses pyperclip (which auto-detects xclip/xsel/pbcopy).
+    """
+    if _IS_WINDOWS:
+        try:
+            result = subprocess.run(
+                ["powershell", "-command", "Get-Clipboard"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            if result.returncode != 0:
+                return {"error": f"clipboard unavailable: {result.stderr.strip()}"}
+            return result.stdout.strip()
+        except Exception as exc:
+            return {"error": f"clipboard unavailable: {exc}"}
+
+    # Linux / macOS path — pyperclip handles pbcopy/xclip/xsel detection.
     try:
-        result = subprocess.run(
-            ["powershell", "-command", "Get-Clipboard"],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-        if result.returncode != 0:
-            return {"error": f"clipboard unavailable: {result.stderr.strip()}"}
-        return result.stdout.strip()
+        import pyperclip  # type: ignore
+    except ImportError:
+        return {"error": "clipboard unavailable: install with 'pip install pyperclip'"}
+    try:
+        return pyperclip.paste()
     except Exception as exc:
+        # pyperclip raises PyperclipException when no backend is installed
+        # (Linux without xclip/xsel/wl-copy). Return a clean error string.
         return {"error": f"clipboard unavailable: {exc}"}
 
 
 def execute_clipboard_write(params: ClipboardWriteParams) -> dict[str, Any]:
-    """Write text to the Windows clipboard via clip.exe."""
+    """
+    Write text to the system clipboard.
+    Windows: uses clip.exe with UTF-16-LE encoding (no extra deps).
+    Linux/macOS: uses pyperclip.
+    """
+    if _IS_WINDOWS:
+        try:
+            subprocess.run(
+                ["clip"],
+                input=params.text.encode("utf-16-le"),
+                check=True,
+                timeout=10,
+            )
+            return {"written": True}
+        except Exception as exc:
+            return {"error": str(exc)}
+
     try:
-        subprocess.run(
-            ["clip"],
-            input=params.text.encode("utf-16-le"),
-            check=True,
-            timeout=10,
-        )
+        import pyperclip  # type: ignore
+    except ImportError:
+        return {"error": "clipboard unavailable: install with 'pip install pyperclip'"}
+    try:
+        pyperclip.copy(params.text)
         return {"written": True}
     except Exception as exc:
-        return {"error": str(exc)}
+        return {"error": f"clipboard unavailable: {exc}"}
 
 
 def execute_open_app(params: OpenAppParams) -> dict[str, Any]:
@@ -500,7 +538,11 @@ def execute_open_app(params: OpenAppParams) -> dict[str, Any]:
 
 
 def execute_take_screenshot(params: TakeScreenshotParams) -> dict[str, Any]:
-    """Take a screenshot and save it; requires pillow or mss."""
+    """
+    Take a screenshot and save it.
+    Uses mss as the primary cross-platform backend (Windows/Linux/macOS).
+    Falls back to PIL.ImageGrab on Windows if mss is unavailable.
+    """
     # Determine output filepath
     if params.filename:
         filepath = Path(params.filename).expanduser()
@@ -512,28 +554,37 @@ def execute_take_screenshot(params: TakeScreenshotParams) -> dict[str, Any]:
 
     filepath.parent.mkdir(parents=True, exist_ok=True)
 
-    # Try pillow first
-    try:
-        from PIL import ImageGrab  # type: ignore
-        img = ImageGrab.grab()
-        img.save(str(filepath))
-        w, h = img.size
-        return {"path": str(filepath), "width": w, "height": h}
-    except ImportError:
-        pass
-
-    # Fallback to mss
+    # Primary: mss (cross-platform — works on Windows, Linux, macOS).
     try:
         import mss  # type: ignore
+        import mss.tools  # type: ignore
         with mss.mss() as sct:
             monitor = sct.monitors[0]  # full virtual screen
             shot = sct.grab(monitor)
-            sct.shot(output=str(filepath))
+            mss.tools.to_png(shot.rgb, shot.size, output=str(filepath))
             return {"path": str(filepath), "width": shot.width, "height": shot.height}
     except ImportError:
         pass
+    except Exception as exc:
+        # mss can fail on Linux without a display (headless CI). Fall through
+        # to PIL on Windows, otherwise return a clean error below.
+        if not _IS_WINDOWS:
+            return {"error": f"screenshot failed: {exc}"}
 
-    return {"error": "Install pillow or mss: pip install pillow"}
+    # Windows-only fallback: PIL.ImageGrab (kept for back-compat — no new dep).
+    if _IS_WINDOWS:
+        try:
+            from PIL import ImageGrab  # type: ignore
+            img = ImageGrab.grab()
+            img.save(str(filepath))
+            w, h = img.size
+            return {"path": str(filepath), "width": w, "height": h}
+        except ImportError:
+            pass
+        except Exception as exc:
+            return {"error": f"screenshot failed: {exc}"}
+
+    return {"error": "Install mss: pip install mss"}
 
 
 # ---------------------------------------------------------------------------

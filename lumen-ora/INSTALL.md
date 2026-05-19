@@ -116,6 +116,45 @@ wsl -d Ubuntu-22.04 -- bash -c "cd /mnt/c/.../prototype/policy-engine && cargo b
 # 4. Verify llama-server.exe exists in prototype\inference-bridge\llama-cpp\
 ```
 
+## Remote access via Tailscale
+
+Lumen Ora binds to `127.0.0.1` by default. To reach it from your phone or
+another machine over your private tailnet:
+
+1. **Install Tailscale** on the host machine and on your phone from
+   https://tailscale.com/download (free for personal use, ~30 seconds).
+2. **`tailscale up`** on both devices and log in to the same tailnet.
+3. **Set the bridge's env vars** on the host before starting:
+   ```powershell
+   # Generate a strong token (do this once):
+   $env:LUMEN_API_TOKEN = python -c "import secrets; print(secrets.token_urlsafe(32))"
+   # Listen on every interface (including the Tailscale interface):
+   $env:LUMEN_BIND_HOST = "0.0.0.0"
+   ```
+   If you set `LUMEN_BIND_HOST=0.0.0.0` without `LUMEN_API_TOKEN` the bridge
+   prints a large warning at startup — anyone on your LAN could hit it.
+4. **Start the stack** with `prototype\start.bat` as usual.
+5. **From your phone**, browse to `http://<host-magic-dns-name>:8765/` (find
+   the host name with `tailscale status` on the host machine — it looks like
+   `my-laptop.tailnet-xxxx.ts.net`). The dashboard prompts for the token on
+   first load and remembers it via `localStorage`.
+
+The dashboard has a mobile-friendly layout below 768 px width and works on
+iOS and Android Chromium browsers. SSE streaming uses the `?token=` query
+parameter because `EventSource` cannot set custom headers.
+
+### Why Tailscale and not just open the port?
+
+The bridge can run tools on your machine. The bearer token is a hard
+requirement (the bridge enforces it), but a tailnet gives you:
+
+- Private, end-to-end-encrypted transport between your devices
+- No router config, no firewall holes, no DNS, no public IP
+- ACLs you can tighten further if you share the tailnet with others
+
+For multi-user or untrusted networks, use the policy engine's audit log to
+track every tool call from every session.
+
 ## Troubleshooting
 
 **`cargo: command not found` during WSL build.**

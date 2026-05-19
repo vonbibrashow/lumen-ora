@@ -532,28 +532,51 @@ def run_tool_execution_tests() -> bool:
     except Exception as e:
         all_ok &= record("edit_file replaces string", False, str(e))
 
-    # ── Test: clipboard round-trip (Windows only, skip gracefully on failure) ─
+    # ── Test: clipboard round-trip ────────────────────────────────────────────
+    # Works on Windows (PowerShell + clip.exe) and on Linux/macOS when
+    # pyperclip + a backend (xclip/xsel/wl-copy/pbcopy) is available.
+    # Headless CI Linux without a clipboard backend is non-fatal: we record
+    # PASS-with-skip so the cross-platform path is exercised but not gated.
+    import platform as _plat
     try:
-        dispatch_tool("clipboard_write", {"text": "lumen-test-123"})
-        got = dispatch_tool("clipboard_read", {})
-        if isinstance(got, dict):
-            all_ok &= record("clipboard write/read", False, str(got))
+        write_result = dispatch_tool("clipboard_write", {"text": "lumen-test-123"})
+        if isinstance(write_result, dict) and "error" in write_result:
+            # No backend available — non-fatal on non-Windows (e.g. headless CI).
+            if _plat.system() == "Windows":
+                all_ok &= record("clipboard write/read", False, str(write_result))
+            else:
+                record("clipboard write/read",
+                       True, f"skipped: {write_result.get('error')}")
         else:
-            all_ok &= record("clipboard write/read", "lumen-test-123" in str(got))
+            got = dispatch_tool("clipboard_read", {})
+            if isinstance(got, dict):
+                if _plat.system() == "Windows":
+                    all_ok &= record("clipboard write/read", False, str(got))
+                else:
+                    record("clipboard write/read",
+                           True, f"skipped: {got.get('error')}")
+            else:
+                all_ok &= record("clipboard write/read", "lumen-test-123" in str(got))
     except Exception as e:
         record("clipboard write/read", True, f"skipped: {e}")  # non-fatal on CI
 
     # ── Test: take_screenshot ─────────────────────────────────────────────────
+    # mss is the primary backend on all platforms; on headless Linux CI
+    # without a display it will error cleanly — non-fatal.
     try:
         result = dispatch_tool("take_screenshot", {})
         if "error" in str(result):
-            record("take_screenshot", True, f"skipped: {result}")  # pillow/mss not installed
+            record("take_screenshot", True, f"skipped: {result}")  # mss/PIL not installed or headless
         else:
             p = Path(result.get("path", ""))
             all_ok &= record("take_screenshot saves file", p.exists())
             if p.exists(): p.unlink()
     except Exception as e:
-        all_ok &= record("take_screenshot", False, str(e))
+        # Cross-platform: headless display can raise rather than return {error}.
+        if _plat.system() == "Windows":
+            all_ok &= record("take_screenshot", False, str(e))
+        else:
+            record("take_screenshot", True, f"skipped: {e}")
 
     return all_ok
 
@@ -1012,6 +1035,184 @@ def run_auth_tests() -> tuple[bool, subprocess.Popen | None]:
 
 
 # ===========================================================================
+# LAYER 3c: Tailscale-friendly remote bind (LUMEN_BIND_HOST=0.0.0.0)
+# ===========================================================================
+
+REMOTE_BRIDGE_PORT = 8768  # separate port to avoid clobbering other bridges
+REMOTE_TEST_TOKEN = "test-remote-token-xyz-789"
+
+
+def _get_non_loopback_ipv4() -> str | None:
+    """
+    Return a non-loopback IPv4 address for this host, or None if we can't
+    find one (e.g. machine has no network interface up). Cross-platform.
+    """
+    # Trick: open a UDP socket to a public-looking address. No packets sent,
+    # but the kernel binds it to the interface it would use for that route.
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.settimeout(1.0)
+            s.connect(("10.255.255.255", 1))
+            ip = s.getsockname()[0]
+        if ip and not ip.startswith("127."):
+            return ip
+    except OSError:
+        pass
+
+    # Fallback: iterate all addresses returned for this host's name.
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            ip = info[4][0]
+            if ip and not ip.startswith("127."):
+                return ip
+    except socket.gaierror:
+        pass
+    return None
+
+
+def _start_remote_bridge() -> subprocess.Popen | None:
+    """
+    Start a bridge subprocess with LUMEN_BIND_HOST=0.0.0.0 and
+    LUMEN_API_TOKEN set, on a separate port so it can't clobber the
+    other test bridges.
+    """
+    bridge_dir = Path(__file__).parent / "inference-bridge"
+    bridge_py = bridge_dir / "bridge.py"
+    if not bridge_py.exists():
+        return None
+
+    env = os.environ.copy()
+    env["LUMEN_API_TOKEN"] = REMOTE_TEST_TOKEN
+    env["LUMEN_BIND_HOST"] = "0.0.0.0"
+    env["BRIDGE_PORT"] = str(REMOTE_BRIDGE_PORT)
+    env["POLICY_ENGINE_SOCKET"] = "tcp://127.0.0.1:8766"
+
+    cmd = [sys.executable, str(bridge_py), "--port", str(REMOTE_BRIDGE_PORT)]
+    print(f"  Starting remote-bridge: {' '.join(cmd)}")
+    try:
+        proc = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except Exception:
+        return None
+
+    # Wait for it to come up via loopback /health.
+    for _ in range(20):
+        try:
+            import urllib.request
+            with urllib.request.urlopen(
+                f"http://127.0.0.1:{REMOTE_BRIDGE_PORT}/health", timeout=2
+            ) as r:
+                if r.status == 200:
+                    return proc
+        except Exception:
+            pass
+        time.sleep(0.5)
+    proc.terminate()
+    return None
+
+
+def run_remote_bind_tests() -> tuple[bool, subprocess.Popen | None]:
+    """
+    Verify LUMEN_BIND_HOST=0.0.0.0 makes the bridge reachable on a
+    non-loopback interface. Skipped (passes vacuously) on hosts with
+    no usable non-loopback IPv4.
+    """
+    section("LAYER 3c — Tailscale-friendly remote bind (LUMEN_BIND_HOST)")
+
+    # Dep check first
+    missing = []
+    for pkg in ("fastapi", "uvicorn", "httpx", "pydantic", "sse_starlette"):
+        try:
+            __import__(pkg)
+        except ImportError:
+            missing.append(pkg)
+    if missing:
+        record("remote-bridge dependencies installed", False, f"Missing: {missing}")
+        return False, None
+
+    non_loopback_ip = _get_non_loopback_ipv4()
+    if not non_loopback_ip:
+        # No usable interface — record as pass with a note so CI doesn't fail.
+        record("non-loopback IPv4 available",
+               True,
+               "skipped: no non-loopback interface (CI / offline host)")
+        return True, None
+    record("non-loopback IPv4 available", True, non_loopback_ip)
+
+    proc = _start_remote_bridge()
+    if proc is None:
+        record("remote-bridge start (LUMEN_BIND_HOST=0.0.0.0)", False,
+               f"Could not start bridge on port {REMOTE_BRIDGE_PORT}")
+        return False, proc
+    record("remote-bridge start (LUMEN_BIND_HOST=0.0.0.0)", True,
+           f"port {REMOTE_BRIDGE_PORT}")
+
+    all_ok = True
+    import urllib.request, urllib.error
+
+    # ── Test 1: /health reachable on the non-loopback interface ──────────────
+    try:
+        url = f"http://{non_loopback_ip}:{REMOTE_BRIDGE_PORT}/health"
+        with urllib.request.urlopen(url, timeout=5) as r:
+            body = json.loads(r.read())
+        ok = r.status == 200 and body.get("status") == "ok"
+        all_ok &= record(
+            f"GET /health via {non_loopback_ip}:{REMOTE_BRIDGE_PORT} → 200",
+            ok, str(body),
+        )
+    except Exception as e:
+        all_ok &= record(
+            f"GET /health via {non_loopback_ip}:{REMOTE_BRIDGE_PORT}",
+            False, str(e),
+        )
+
+    # ── Test 2: socket-level probe — confirms bridge bound 0.0.0.0, not 127.* ──
+    # Even if HTTP routing differs, a raw socket connect to the non-loopback
+    # IP on the bridge port must succeed when LUMEN_BIND_HOST=0.0.0.0.
+    try:
+        with socket.create_connection(
+            (non_loopback_ip, REMOTE_BRIDGE_PORT), timeout=3.0
+        ):
+            all_ok &= record(
+                f"TCP connect to {non_loopback_ip}:{REMOTE_BRIDGE_PORT} succeeds",
+                True, "bridge is listening on a non-loopback address",
+            )
+    except OSError as e:
+        all_ok &= record(
+            f"TCP connect to {non_loopback_ip}:{REMOTE_BRIDGE_PORT}",
+            False,
+            f"bridge did not bind to 0.0.0.0 — connect failed: {e}",
+        )
+
+    # ── Test 3: auth still enforced on remote interface (token required) ─────
+    # Confirms /infer is still protected even when reached from another host.
+    try:
+        req = urllib.request.Request(
+            f"http://{non_loopback_ip}:{REMOTE_BRIDGE_PORT}/infer",
+            data=json.dumps({"prompt": "hi", "stream": False}).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        status = None
+        try:
+            with urllib.request.urlopen(req, timeout=10) as r:
+                status = r.status
+        except urllib.error.HTTPError as e:
+            status = e.code
+        ok = status == 401
+        all_ok &= record(
+            "POST /infer on remote interface without token → 401",
+            ok, f"status={status}",
+        )
+    except Exception as e:
+        all_ok &= record(
+            "POST /infer on remote interface without token → 401",
+            False, str(e),
+        )
+
+    return all_ok, proc
+
+
+# ===========================================================================
 # LAYER 4: Full end-to-end pipeline test (requires llama-server + model)
 # ===========================================================================
 
@@ -1236,6 +1437,11 @@ Examples:
 
             # Layer 3b: Bridge auth gating
             ok, proc = run_auth_tests()
+            if proc:
+                processes.append(proc)
+
+            # Layer 3c: Tailscale-friendly remote bind (LUMEN_BIND_HOST=0.0.0.0)
+            ok, proc = run_remote_bind_tests()
             if proc:
                 processes.append(proc)
 

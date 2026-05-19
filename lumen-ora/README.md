@@ -77,6 +77,31 @@ Start http://localhost:8765
 
 The installer handles llama.cpp, Qwen2.5-7B model download (~4 GB), and all Python dependencies. First run takes 5–10 minutes depending on your connection.
 
+## Remote access via Tailscale
+
+Lumen Ora binds to `127.0.0.1` by default — single-user, local-only. To use it
+from your phone or another laptop over your private [tailnet](https://tailscale.com/),
+five steps:
+
+1. **Install Tailscale** on the host machine and on your phone — `https://tailscale.com/download`
+2. **`tailscale up`** on both devices and sign in to the same tailnet
+3. **Set two env vars on the host** before starting the bridge:
+   ```powershell
+   $env:LUMEN_API_TOKEN = "your-long-random-string-here"   # required for remote access
+   $env:LUMEN_BIND_HOST = "0.0.0.0"                         # listen on every interface
+   ```
+   The bridge refuses to bind to `0.0.0.0` quietly — it prints a loud warning
+   if you forget the token. Generate one with `python -c "import secrets; print(secrets.token_urlsafe(32))"`.
+4. **Start the bridge** as usual (`prototype\start.bat` or `prototype\start.ps1`)
+5. **From your phone**, open `http://<host-magic-dns-name>:8765/` (e.g.
+   `http://my-laptop.tailnet-xxxx.ts.net:8765/`) — the dashboard prompts for
+   the token on first load and remembers it in `localStorage`.
+
+Why Tailscale and not just open the port? The bridge can execute tools on
+your machine. The token is a hard requirement, but a tailnet adds private,
+end-to-end-encrypted transport without poking holes in your firewall. The
+dashboard is mobile-friendly out of the box.
+
 ## Architecture
 
 ```

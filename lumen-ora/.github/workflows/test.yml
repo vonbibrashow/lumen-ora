@@ -19,12 +19,12 @@ jobs:
           python-version: ${{ matrix.python-version }}
 
       - name: Install core dependencies (all platforms)
-        run: pip install httpx fastapi uvicorn sse-starlette pydantic rich ddgs pyttsx3 pillow
+        run: pip install httpx fastapi uvicorn sse-starlette pydantic rich ddgs pyttsx3 pillow mss
 
       - name: Install audio/input dependencies (Linux/macOS optional)
         if: runner.os != 'Windows'
         run: |
-          pip install sounddevice soundfile || echo "audio deps optional; continuing"
+          pip install sounddevice soundfile pyperclip pynput || echo "audio/input deps optional; continuing"
         shell: bash
 
       - name: Install Windows-specific dependencies

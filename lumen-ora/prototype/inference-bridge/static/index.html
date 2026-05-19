@@ -2,7 +2,10 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<meta name="theme-color" content="#0f1117">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <title>Lumen Ora</title>
 <style>
   *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
@@ -110,6 +113,67 @@
   .welcome { align-self: center; text-align: center; color: var(--muted); padding: 40px 20px; }
   .welcome h2 { font-size: 20px; color: var(--text); margin-bottom: 8px; }
   .welcome p { line-height: 1.6; font-size: 13px; }
+
+  /* ── Mobile (≤ 768px): hide sidebar, larger touch targets, safe areas ── */
+  @media (max-width: 768px) {
+    html, body { font-size: 15px; }
+    #app {
+      grid-template-rows: 52px 1fr 36px;
+      grid-template-columns: 1fr;
+      height: 100vh;
+      height: 100dvh;  /* dynamic viewport height — handles mobile URL bar */
+    }
+    #header {
+      padding: 0 12px;
+      padding-top: env(safe-area-inset-top, 0);
+      height: calc(52px + env(safe-area-inset-top, 0));
+    }
+    #sidebar { display: none; }  /* tool log hidden on phone — accessible later */
+    #chat { border-right: none; }
+    #statsbar {
+      padding: 0 12px;
+      padding-bottom: env(safe-area-inset-bottom, 0);
+      gap: 12px;
+      overflow-x: auto;
+      white-space: nowrap;
+      -webkit-overflow-scrolling: touch;
+    }
+    /* Hide model-online stats on mobile to save space */
+    #statsbar .stat-item:nth-child(n+4) { display: none; }
+    .msg { max-width: 92%; }
+    .msg-bubble { padding: 12px 14px; font-size: 15px; }
+    .tool-card { max-width: 100%; }
+    #messages { padding: 12px; gap: 10px; }
+    #input-area {
+      padding: 10px 12px;
+      padding-bottom: calc(10px + env(safe-area-inset-bottom, 0));
+      gap: 8px;
+    }
+    #prompt-input {
+      font-size: 16px;  /* 16px prevents iOS auto-zoom on focus */
+      padding: 11px 14px;
+      min-height: 44px;  /* iOS recommended touch target */
+    }
+    #send-btn {
+      padding: 0 20px;
+      min-height: 44px;
+      min-width: 64px;
+      font-size: 15px;
+    }
+    .tier-badge {
+      min-height: 32px;
+      padding: 4px 12px;
+      font-size: 12px;
+    }
+    #header h1 { font-size: 16px; }
+  }
+  /* Extra-narrow phones (≤ 390px / iPhone 13 mini etc.) */
+  @media (max-width: 390px) {
+    #header h1 { font-size: 15px; }
+    #model-toggle { gap: 4px; }
+    .tier-badge { padding: 4px 10px; font-size: 11px; }
+    #send-btn { padding: 0 14px; min-width: 56px; }
+  }
 </style>
 </head>
 <body>

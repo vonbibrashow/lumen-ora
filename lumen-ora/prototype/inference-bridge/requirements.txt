@@ -4,3 +4,13 @@ httpx>=0.27.0
 pydantic>=2.6.0
 sse-starlette>=2.0.0
 ddgs>=8.0.0
+
+# ---------------------------------------------------------------------------
+# Cross-platform tool deps (Linux/macOS)
+# ---------------------------------------------------------------------------
+# mss          — cross-platform screen capture (primary backend on all OSes).
+# pyperclip    — cross-platform clipboard (xclip/xsel/pbcopy auto-detect).
+# Windows can rely on built-in PowerShell + clip.exe, so these are optional
+# there but recommended (mss also works on Windows).
+mss>=9.0.0; sys_platform != "win32"
+pyperclip>=1.8.2; sys_platform != "win32"

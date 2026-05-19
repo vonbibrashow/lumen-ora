@@ -82,12 +82,33 @@ except ImportError:
     _SF_OK = False
     _VOICE_MISSING.append("soundfile")
 
-try:
-    import keyboard as _keyboard_mod  # noqa: F401
-    _KB_OK = True
-except ImportError:
-    _KB_OK = False
-    _VOICE_MISSING.append("keyboard")
+# Hotkey detection. On Windows we use the `keyboard` module (no root needed).
+# On Linux/macOS `keyboard` requires root, so we prefer `pynput` instead.
+# At least one of the two backends must be importable for push-to-talk.
+_KB_BACKEND: str | None = None
+_KB_OK = False
+
+if _platform.system() == "Windows":
+    try:
+        import keyboard as _keyboard_mod  # noqa: F401
+        _KB_OK = True
+        _KB_BACKEND = "keyboard"
+    except ImportError:
+        _VOICE_MISSING.append("keyboard")
+else:
+    # Linux / macOS — try pynput first (no root required).
+    try:
+        from pynput import keyboard as _pynput_keyboard  # noqa: F401
+        _KB_OK = True
+        _KB_BACKEND = "pynput"
+    except ImportError:
+        # Last-resort fallback to the `keyboard` module — works but needs root.
+        try:
+            import keyboard as _keyboard_mod  # noqa: F401
+            _KB_OK = True
+            _KB_BACKEND = "keyboard"
+        except ImportError:
+            _VOICE_MISSING.append("pynput")
 
 try:
     from faster_whisper import WhisperModel as _WhisperModel  # noqa: F401
@@ -851,15 +872,13 @@ class VoiceEngine:
         """
         Record audio while Space is held; transcribe on release.
         Returns transcribed text, or '' if nothing usable.
-        Requires keyboard + sounddevice + soundfile + faster-whisper.
+        Requires (keyboard OR pynput) + sounddevice + soundfile + faster-whisper.
 
         Safety: recording is capped at 30 seconds to prevent accidental
         indefinite holds.
         """
         if not (_KB_OK and _SD_OK and _SF_OK and _WHISPER_OK):
             return ""
-
-        import keyboard
 
         console.print(_dim("  [recording…] Release Space when done (max 30 s)."), end="\r")
 
@@ -869,29 +888,62 @@ class VoiceEngine:
             return ""
 
         # Block until Space key is released, with a 30-second safety cap.
-        # keyboard.wait() has no built-in timeout; we use a daemon thread to
-        # enforce the cap by programmatically releasing the wait.
         _MAX_RECORD_SECONDS = 30
         _timed_out = [False]
 
-        def _timeout_guard():
-            import time
-            time.sleep(_MAX_RECORD_SECONDS)
-            if self._recording:
-                _timed_out[0] = True
-                # Trigger the release event so keyboard.wait() unblocks
+        if _KB_BACKEND == "keyboard":
+            import keyboard
+
+            def _timeout_guard():
+                import time
+                time.sleep(_MAX_RECORD_SECONDS)
+                if self._recording:
+                    _timed_out[0] = True
+                    # Trigger the release event so keyboard.wait() unblocks
+                    try:
+                        keyboard.release("space")
+                    except Exception:
+                        pass
+
+            _guard = threading.Thread(target=_timeout_guard, daemon=True)
+            _guard.start()
+
+            try:
+                keyboard.wait("space", suppress=True, trigger_on_release=True)
+            except Exception:
+                pass
+
+        elif _KB_BACKEND == "pynput":
+            # pynput.keyboard: listen for the Space key release. Works on
+            # Linux/macOS without root.
+            from pynput import keyboard as pyn_keyboard  # type: ignore
+
+            released = threading.Event()
+
+            def _on_release(key):
                 try:
-                    keyboard.release("space")
+                    if key == pyn_keyboard.Key.space:
+                        released.set()
+                        return False  # stop listener
                 except Exception:
                     pass
+                return None
 
-        _guard = threading.Thread(target=_timeout_guard, daemon=True)
-        _guard.start()
-
-        try:
-            keyboard.wait("space", suppress=True, trigger_on_release=True)
-        except Exception:
-            pass
+            listener = pyn_keyboard.Listener(on_release=_on_release)
+            listener.start()
+            try:
+                if not released.wait(timeout=_MAX_RECORD_SECONDS):
+                    _timed_out[0] = True
+            finally:
+                try:
+                    listener.stop()
+                except Exception:
+                    pass
+        else:
+            # No hotkey backend available — should be unreachable thanks to
+            # _KB_OK guard above, but guard defensively anyway.
+            self.stop_recording()
+            return ""
 
         audio = self.stop_recording()
         console.print(" " * 60, end="\r")  # clear the recording line
@@ -1557,40 +1609,60 @@ def _read_voice_or_text(voice_state: dict, prompt_str: str) -> str | None:
             return None
 
     # --- Voice mode ---
-    import keyboard
-
     # Print the prompt without a newline so it appears inline.
     sys.stdout.write(prompt_str)
     sys.stdout.flush()
 
-    try:
-        event = keyboard.read_event(suppress=False)
-        if event.event_type == "down" and event.name == "space":
-            # Clear the prompt line
-            sys.stdout.write("\r" + " " * (len(prompt_str) + 2) + "\r")
-            sys.stdout.flush()
-            ve = _get_voice_engine()
-            text = ve.push_to_talk()
-            return text if text else ""
-        else:
-            # A non-Space key was pressed; clear and fall back to normal input
-            sys.stdout.write("\r" + " " * (len(prompt_str) + 2) + "\r")
-            sys.stdout.flush()
-            return input(prompt_str)
-    except EOFError:
-        raise
-    except KeyboardInterrupt:
-        console.print()
-        return None
-    except Exception:
-        # keyboard module failed or unavailable at runtime — fall back
+    if _KB_BACKEND == "keyboard":
+        import keyboard
+
         try:
-            return input(prompt_str)
+            event = keyboard.read_event(suppress=False)
+            if event.event_type == "down" and event.name == "space":
+                # Clear the prompt line
+                sys.stdout.write("\r" + " " * (len(prompt_str) + 2) + "\r")
+                sys.stdout.flush()
+                ve = _get_voice_engine()
+                text = ve.push_to_talk()
+                return text if text else ""
+            else:
+                # A non-Space key was pressed; clear and fall back to normal input
+                sys.stdout.write("\r" + " " * (len(prompt_str) + 2) + "\r")
+                sys.stdout.flush()
+                return input(prompt_str)
         except EOFError:
             raise
         except KeyboardInterrupt:
             console.print()
             return None
+        except Exception:
+            # keyboard module failed or unavailable at runtime — fall back
+            try:
+                return input(prompt_str)
+            except EOFError:
+                raise
+            except KeyboardInterrupt:
+                console.print()
+                return None
+
+    # pynput-backed voice mode (Linux / macOS without root).
+    # pynput cannot easily replicate keyboard.read_event() blocking on the
+    # terminal, so we fall back to a simpler convention: if the line starts
+    # with a Space we treat it as a PTT trigger; otherwise, plain text input.
+    try:
+        line = input(prompt_str)
+    except EOFError:
+        raise
+    except KeyboardInterrupt:
+        console.print()
+        return None
+
+    if line.startswith(" "):
+        # Caller pressed Space then Enter → enter PTT mode.
+        ve = _get_voice_engine()
+        text = ve.push_to_talk()
+        return text if text else ""
+    return line
 
 
 # ---------------------------------------------------------------------------

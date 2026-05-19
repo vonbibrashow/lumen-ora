@@ -18,7 +18,10 @@ ddgs>=8.0.0
 # soundfile>=0.12.1
 
 # Hotkey detection: push-to-talk (Space key)
-# keyboard>=0.13.5
+# Windows: use `keyboard` (no root required).
+# Linux/macOS: use `pynput` (works as a normal user; `keyboard` needs root).
+# keyboard>=0.13.5    ; sys_platform == "win32"
+# pynput>=1.7.6       ; sys_platform != "win32"
 
 # Text-to-speech: Windows SAPI / macOS NSSpeech / Linux espeak (all offline)
 # pyttsx3>=2.90
